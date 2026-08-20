@@ -17,10 +17,14 @@ This is an experimental research integration. It is not production-ready, not a 
 | `bridge_ui.py` | Local web server (default `http://localhost:8080`) for the live first-person view embedded in the panel, plus a `/replay` session browser. Without it, the panel's right pane is blank. |
 | `recorder_live.py` | Records every session to `sessions/` (video, user/AI audio tracks, `events.jsonl` subtitles, `meta.json`). |
 | `rerun_source.py` | Replays a recorded session back through the model (see [Rerun mode](#rerun-mode-command-line)). Not wired into the panel. |
+| `perception/` | Optional non-blocking CV shadow providers. Includes a YOLO ONNX reference and an OCR provider template. |
 | `devices.json` | Glasses IP / rotation table. The panel's device dropdown follows this file. |
 | `templates/` | `live.html`, `replay.html`, `replay_index.html` — served by `bridge_ui.py`. |
 
 The entry point is the repository-root `glasses_panel.py`, an 8-line shim that calls `runtime.openglass_omni.panel:main`.
+
+For the Phase A/Phase B control contract, ESP32 commands, and the OCR plugin
+handoff, see the [Chinese V1.1 guide](../../docs/phase_ab_esp32_ocr_handoff_zh.md).
 
 ## Process chain
 
