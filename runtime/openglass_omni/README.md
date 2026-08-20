@@ -1,6 +1,10 @@
 # OpenGlass Omni Runtime
 
-This directory holds OpenGlass's own control panel, the ESP32 audio/video bridge, the Rokid link, and the local session recording / replay code. The MiniCPM-o-Demo and llama.cpp-omni projects stay **external** — nothing here is copied into an upstream directory, and this panel never downloads, builds, or rewrites upstream config.
+This directory holds OpenGlass's control panel, ESP32 audio/video bridge, Rokid
+link, and local recording/replay code. The shared voice-command Core is included
+in this repository at `extensions/assistive_harness/`. MiniCPM-o-Demo,
+llama.cpp-omni, their workers and large-model weights remain **external**; this
+panel never downloads, builds, or rewrites their upstream configuration.
 
 This is an experimental research integration. It is not production-ready, not a certified navigation aid, and not validated for unbounded-length sessions.
 
@@ -121,7 +125,9 @@ Watch the rerun via the bridge's own live view at `http://localhost:<ui-port>/`.
 ## Current boundaries
 
 - The panel starts and supervises processes and shows the first-person view; it does not own model weights, backend paths, or upstream configuration.
-- `worker.py` / `gateway.py` and the model weights come from external upstream projects and are not vendored here.
+- `worker.py` / `gateway.py` and large-model weights come from external upstream
+  projects and are not vendored here. The small Harness Core itself is vendored
+  under `extensions/assistive_harness/` and can be installed from this clone.
 - The Rokid link is included, but its gateway protocol may differ from the ESP32 link depending on your build; treat the ESP32 link as the primary supported path.
 - One-click rerun from within the panel is not implemented; rerun is the command-line workflow above.
 - Session output under `sessions/` may contain faces, surroundings, voices, and device addresses. Review it before sharing or publishing.

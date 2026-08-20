@@ -19,7 +19,7 @@ Phase B: Rokid 或 ESP32 -> Device Adapter ----+               |
 llama.cpp-omni -> Worker -> Gateway :8040 -> MiniCPM-o 4.5 -> PC 扬声器
 ```
 
-- `MiniCPM-o-Demo-Comni/extensions/assistive_harness/` 是唯一的命令 Router、状态机、Skill YAML、prompt 和控制协议实现。
+- `OpenGlass/extensions/assistive_harness/` 是唯一的命令 Router、状态机、Skill YAML、prompt 和控制协议实现。
 - OpenGlass 只负责 ESP32/Rokid 的 JPEG、PCM、播放、录制以及可选 CV provider。不要在设备端再复制一套关键词或状态机。
 - RESET 和 Skill 切换只替换 Gateway Session，不能重载 Worker 或模型后端。
 - CV provider 只返回统一的 `CVObservation`。V1.1 的 ESP32 接入是旁路日志，不能阻塞主音频链路。
@@ -81,30 +81,30 @@ git switch -c feature/esp32-ocr-<backend>
 `feature/phase-b-rokid-debug`。各自通过 PR 合并回协作基线；确认设备回归后，
 再向 OpenGlass `main` 提交上游 PR。
 
-需要两个并列仓库：
+完整 MiniCPM 后端仍是外部依赖，但 Harness 与 OpenGlass 设备/CV 代码现在都由
+这一个协作分支提供：
 
 ```text
-C:\Users\Lenovo\AI_Glasses_0618\MiniCPM-o-Demo-Comni
-C:\Users\Lenovo\AI_WAIC\github\OpenGlass
+<任意目录>\MiniCPM-o-Demo-Comni    # 外部 Worker/Gateway/网页后端
+<任意目录>\OpenGlass               # 本分支：Harness + Phase B + CV/OCR
 ```
 
 OpenGlass 分支检查：
 
 ```bat
-cd /d C:\Users\Lenovo\AI_WAIC\github\OpenGlass
+cd /d C:\path\to\OpenGlass
 git switch codex/phase-b-v1.1-esp32-ocr-handoff
 git status --short --branch
 ```
 
-当前本机的 `MiniCPM-o-Demo-Comni` 目录不是 Git 工作树。因此本 OpenGlass
-分支只包含设备适配、CV 插件骨架和本文，**不会自动包含 Harness Core 的
-V1.1 修改**。交付给同事时应同时提供经过审阅的 MiniCPM 工作目录归档，或
-后续把它接入一个明确的远端仓库；不要把 Harness Core 复制进 OpenGlass。
+本分支已经包含完整 Harness Core、Rokid Phase B 入口、浏览器薄适配资产和
+ESP32/CV 插件骨架。同事不再需要接收本机 MiniCPM 工作目录归档。只有
+`llama.cpp-omni -> Worker -> Gateway` 后端和模型权重继续作为外部依赖。
 
 本次文件边界如下：
 
 ```text
-MiniCPM-o-Demo-Comni/
+OpenGlass/
   extensions/assistive_harness/model_log.py                 # 新增模型回合聚合
   extensions/assistive_harness/server.py                    # MODEL/playback telemetry
   extensions/assistive_harness/telemetry.py                 # 模型日志文件
@@ -113,8 +113,8 @@ MiniCPM-o-Demo-Comni/
   extensions/assistive_harness/phase_b/rokid_runtime.py      # V1.1 播放与触发
   extensions/assistive_harness/phase_b/README.md             # Rokid 使用说明
   extensions/assistive_harness/tests/                        # 回归测试
-
-OpenGlass/
+  demo_rokid_phase_b_harness.py                              # Rokid 稳定入口
+  integrations/minicpm_browser/                             # Phase A 浏览器薄适配资产
   runtime/openglass_omni/esp32_bridge.py                     # 非阻塞 CV 挂点/CLI
   runtime/openglass_omni/perception/                         # provider/pipeline/YOLO/OCR
   runtime/openglass_omni/requirements-cv.txt                 # 可选 CV 依赖
@@ -128,9 +128,11 @@ ESP32 已烧录连接 `CUDY-D102` 的固件。电脑也要连接同一网络，�
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_WAIC\github\OpenGlass
+cd /d C:\path\to\OpenGlass
 python -m pip install -r runtime\openglass_omni\requirements.txt
 python -m pip install -r runtime\openglass_omni\requirements-cv.txt
+python -m pip install -r extensions\assistive_harness\requirements.txt
+python -m pip install -r extensions\assistive_harness\phase_b\requirements-phase-b.txt
 ```
 
 OCR 后端若需要 PaddleOCR、ONNX Runtime、TensorRT 等额外依赖，请单独增加 `requirements-ocr-<backend>.txt`，不要把重型 OCR 依赖塞入基础 requirements。
@@ -143,7 +145,7 @@ OCR 后端若需要 PaddleOCR、ONNX Runtime、TensorRT 等额外依赖，请单
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_Glasses_0618\MiniCPM-o-Demo-Comni
+cd /d C:\path\to\MiniCPM-o-Demo-Comni
 start_all.cmd --http
 ```
 
@@ -151,11 +153,21 @@ start_all.cmd --http
 
 ### 4.2 Harness Core :8021
 
-打开第二个 Anaconda Prompt：
+`--model-path` 表示本机目录，不是 ModelScope 模型 ID，也不会触发隐式下载。
+第一次使用时，在 OpenGlass 根目录显式下载公开模型：
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_Glasses_0618\MiniCPM-o-Demo-Comni
+cd /d C:\path\to\OpenGlass
+python -m extensions.assistive_harness.download_modelscope_model
+```
+
+ModelScope 默认下载到 `%USERPROFILE%\.cache\modelscope\hub`，命令末尾会打印
+实际 `MODEL_PATH` 和可直接复制的启动命令。之后打开第二个 Anaconda Prompt：
+
+```bat
+conda activate ai_glasses
+cd /d C:\path\to\OpenGlass
 python -m extensions.assistive_harness.server --enabled --model-path "%USERPROFILE%\.cache\modelscope\hub\models\iic\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online" --port 8021
 ```
 
@@ -172,7 +184,9 @@ extensions/assistive_harness/runs/<run-id>/model_transcript.txt
 
 ### 4.3 Chrome Phase A 回归
 
-前两个 Prompt 就绪后，用 Chrome 打开带显式开关的页面：
+前两个 Prompt 就绪后，用 Chrome 打开带显式开关的页面。浏览器薄适配资产
+位于 `integrations/minicpm_browser/`，必须先按其中 README 接入目标版本的
+MiniCPM-o-Demo；不要用一个完整 `omni-app.js` 覆盖不同上游版本。
 
 ```text
 http://127.0.0.1:8040/omni?assistive_harness=1&v=phase-b-v1-1
@@ -188,7 +202,7 @@ STOP、RESUME、RESET、四种 Skill 和 Skill 互切。原生回归则另开
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_Glasses_0618\MiniCPM-o-Demo-Comni
+cd /d C:\path\to\OpenGlass
 python demo_rokid_phase_b_harness.py --gateway localhost:8040 --harness-url ws://127.0.0.1:8021/ws/control --input-gain 12 --image-rotate-cw 270 --session-ready-chime-volume 0.32 --playback-echo-tail-s 0.80
 ```
 
@@ -196,11 +210,21 @@ python demo_rokid_phase_b_harness.py --gateway localhost:8040 --harness-url ws:/
 
 ### 4.5 ESP32 主链路 smoke test（OCR 同事）
 
-先验证 ESP32 输入与 MiniCPM 主链路；把 `<ESP32_IP>` 替换为设备当前地址：
+先验证 ESP32 输入与 MiniCPM 主链路；把 `<ESP32_IP>` 替换为设备当前地址。
+这里的 `SenseVoiceSmall` 是 ESP32 bridge 的可选本地 ASR 模型，与 Harness
+使用的 Paraformer 模型不是同一个目录。第一次使用时显式下载：
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_WAIC\github\OpenGlass
+cd /d C:\path\to\OpenGlass
+python -m extensions.assistive_harness.download_modelscope_model --model-id iic/SenseVoiceSmall
+```
+
+下载程序会打印实际目录。把该目录传给 `--funasr-model`：
+
+```bat
+conda activate ai_glasses
+cd /d C:\path\to\OpenGlass
 python runtime\openglass_omni\esp32_bridge.py --esp32-host <ESP32_IP> --esp32-port 80 --gateway localhost:8040 --no-tls --rotate 180 --enable-funasr --funasr-model "%USERPROFILE%\.cache\modelscope\hub\models\iic\SenseVoiceSmall" --funasr-echo-suppress-s 4.0 --prompt "你是智能眼镜助手。用户问什么就简短回答什么；只有用户要求描述场景或寻找物体时才看图回答，不要主动描述。"
 ```
 
@@ -212,8 +236,8 @@ YOLO 只是验证 provider 接口、异常隔离和非阻塞队列，不是最�
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_WAIC\github\OpenGlass
-python runtime\openglass_omni\esp32_bridge.py --esp32-host <ESP32_IP> --esp32-port 80 --gateway localhost:8040 --no-tls --rotate 180 --cv-shadow-provider yolo_onnx --cv-shadow-options-json "{\"model_path\":\"C:\\Users\\Lenovo\\AI_Glasses_0618\\OmniHarness\\mini_omni_harness\\models\\yolo26n.onnx\",\"device\":\"cpu\"}" --cv-shadow-skill find_object --cv-shadow-slots-json "{\"target\":\"手机\"}" --cv-shadow-timeout-ms 2000 --cv-shadow-log logs\cv_yolo.jsonl
+cd /d C:\path\to\OpenGlass
+python runtime\openglass_omni\esp32_bridge.py --esp32-host <ESP32_IP> --esp32-port 80 --gateway localhost:8040 --no-tls --rotate 180 --cv-shadow-provider yolo_onnx --cv-shadow-options-json "{\"model_path\":\"C:\\path\\to\\OpenGlass\\models\\yolo26n.onnx\",\"device\":\"cpu\"}" --cv-shadow-skill find_object --cv-shadow-slots-json "{\"target\":\"手机\"}" --cv-shadow-timeout-ms 2000 --cv-shadow-log logs\cv_yolo.jsonl
 ```
 
 预期：终端持续出现 `[CV]`，`logs\cv_yolo.jsonl` 每行是一条 `CVObservation`；即使模型加载失败或超时，ESP32 PCM 与 MiniCPM 音频仍应继续。队列容量固定为 1：推理忙时丢弃旧帧，只保留最新等待帧。
@@ -249,13 +273,31 @@ python runtime\openglass_omni\esp32_bridge.py --esp32-host <ESP32_IP> --gateway 
 
 OCR V1 完成标准：真实 ESP32 JPEG 能产出统一结果；异常和超时只形成 observation；音频主链不中断；连续输入发生背压时 `dropped_frames` 增长而内存不增长；至少有一张含中英文的固定测试图和预期文本。
 
-## 7. 测试
+## 7. GitHub 不包含的文件及解决办法
+
+代码、配置模板、测试和启动入口都在本分支中；以下大文件或本机状态有意不进入
+Git，不属于代码遗漏：
+
+| 类别 | 原因 | 获取/放置方式 |
+|---|---|---|
+| Harness Paraformer ASR 权重 | 公开模型体积较大 | 运行 `download_modelscope_model`，使用程序打印的本地路径 |
+| ESP32 `SenseVoiceSmall` 权重 | 可选 bridge ASR | 用同一下载程序加 `--model-id iic/SenseVoiceSmall` |
+| YOLO 权重 | CV 参考插件的可替换资产 | 自行取得兼容 ONNX 权重，放入 `OpenGlass\models\`，不要提交 |
+| OCR 权重/字典 | 由具体 OCR 后端决定 | 放在开发者本机模型目录，通过 provider options 传路径 |
+| MiniCPM-o 4.5/llama.cpp-omni 权重和 Worker/Gateway | 独立后端、体积大 | 按后端仓库安装并启动 `:8040`，OpenGlass 不复制模型 |
+| Wi-Fi 密码、设备 IP、日志、录音 | 私密或运行时数据 | 只保存在本机，通过命令行参数传入 |
+
+因此，克隆本分支后可以直接安装依赖、运行单元测试、启动 Harness 和设备适配层；
+要得到完整 AI 回答，还必须在本机准备公开 ASR 权重，并启动外部 MiniCPM
+Worker/Gateway。OCR 同事只需额外提供其选择的 OCR 依赖和权重。
+
+## 8. 测试
 
 OpenGlass CV 骨架：
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_WAIC\github\OpenGlass
+cd /d C:\path\to\OpenGlass
 python -m unittest discover runtime\openglass_omni\tests -v
 ```
 
@@ -263,13 +305,13 @@ Harness 核心与 Rokid Phase B：
 
 ```bat
 conda activate ai_glasses
-cd /d C:\Users\Lenovo\AI_Glasses_0618\MiniCPM-o-Demo-Comni
+cd /d C:\path\to\OpenGlass
 python -m unittest extensions.assistive_harness.tests.test_core extensions.assistive_harness.tests.test_phase_b_rokid -v
 ```
 
 设备验收顺序：普通问答 -> `停一下` -> `恢复对话` -> `重新开始` -> 找物 -> 识字 -> 场景描述 -> 实验性避障 -> Skill 直接互切 -> 断网重连。每次 RESET/Skill 切换应看到 generation 增加、新 Session ID、`restart_complete`，Skill 还应看到一次 `task_trigger_sent`。
 
-## 8. 协作与后续集成
+## 9. 协作与后续集成
 
 - OCR 同事只在本 OpenGlass 分支新增 provider、测试和依赖文件；不要修改 Phase A 的关键词和状态机。
 - 项目负责人继续在 Rokid 真实设备上校准回声、提示音和 Session 稳定性。
