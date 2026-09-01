@@ -554,6 +554,10 @@ async def rerun_image_loop(
     ready_evt: Optional[asyncio.Event] = None,
     replay_t0=None,
     done_evt: Optional[asyncio.Event] = None,
+    peer_done: Optional[asyncio.Event] = None,
+    speaker=None,
+    sent_tracker=None,
+    tail_wait_s: float = 30.0,
 ) -> None:
     if ready_evt is not None:
         await ready_evt.wait()
@@ -595,6 +599,43 @@ async def rerun_image_loop(
         except asyncio.TimeoutError:
             pass
     LOG.info("[RERUN] image loop 回放完毕")
+    if done_evt is not None:
+        done_evt.set()
+    # -o rerun 的收尾。之前这条路径图放完就什么都不做，结束全靠
+    # rerun_audio_reader 里 `while waited < 120.0` 的兜底干等两分钟
+    #（日志表现：音频推完后一串 audio=0.0pps 的 STATS，两分钟才退），
+    # 而且 --rerun-tail-wait-s 对它无效。
+    # 判定与 esp32_image_loop 保持一致：先等音频也推完，再看模型说完没有
+    #（队列空 且 不在 speak，连续保持 2s 才算），最后加 2s 尾巴。
+    if peer_done is not None and not peer_done.is_set():
+        LOG.info("[RERUN] 图放完，等音频推完…")
+        try:
+            await asyncio.wait_for(peer_done.wait(), timeout=180.0)
+        except asyncio.TimeoutError:
+            LOG.warning("[RERUN] 等音频超时")
+    _QUIET_HOLD_S, _TAIL_S = 2.0, 2.0
+    _quiet_since = None
+    _deadline = time.monotonic() + tail_wait_s
+    while time.monotonic() < _deadline and not stop_evt.is_set():
+        try:
+            pending = speaker.pending_ms() if speaker is not None else 0.0
+        except Exception:
+            pending = 0.0
+        speaking = bool(getattr(sent_tracker, "speaking", False)) if sent_tracker else False
+        if pending <= 50 and not speaking:
+            if _quiet_since is None:
+                _quiet_since = time.monotonic()
+            elif time.monotonic() - _quiet_since >= _QUIET_HOLD_S:
+                break
+        else:
+            _quiet_since = None
+        await asyncio.sleep(0.25)
+    try:
+        await asyncio.wait_for(stop_evt.wait(), timeout=_TAIL_S)
+    except asyncio.TimeoutError:
+        pass
+    LOG.info("[RERUN] 结束（静默保持%.1fs + 尾巴%.1fs）", _QUIET_HOLD_S, _TAIL_S)
+    stop_evt.set()
 
 
 # ============================================================
@@ -1402,6 +1443,9 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                     live_rec=self.live_rec, ready_evt=_ready,
                     replay_t0=lambda: self._replay_t0,
                     done_evt=self._image_done,
+                    peer_done=self._audio_done,
+                    speaker=self.speaker, sent_tracker=self.sent_tracker,
+                    tail_wait_s=self._rerun_tail_wait_s,
                 )),
             ]
             return
