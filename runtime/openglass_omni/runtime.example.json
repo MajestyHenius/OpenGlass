@@ -1,33 +1,28 @@
 {
-  "_comment": "Copy to runtime.local.json. Paths are resolved relative to this file and may use environment variables.",
-  "python": "",
-  "minicpm_demo_root": "${MINICPM_O_DEMO_ROOT}",
-  "llama_cpp_omni_root": "${LLAMA_CPP_OMNI_ROOT}",
-  "devices_file": "devices.local.json",
-  "prompts_file": "prompts.json",
-  "state_dir": "state",
-  "worker": {
-    "host": "127.0.0.1",
-    "port": 22440,
-    "ready_timeout_s": 180
+  "_comment": "复制为 runtime.local.json 后填写。该文件不进仓库（加进 .gitignore）。路径支持 ${ENV_VAR} 和 ~。",
+
+  "_conda": "留空表示已在外部 conda activate；填环境名则由 panel 用 conda run 启动子进程",
+  "conda_env": null,
+
+  "_paths": "三个仓库相互独立，各自填自己的绝对路径",
+  "minicpm_demo_root": "D:\\path\\to\\MiniCPM-o-Demo",
+  "llama_server": "D:\\path\\to\\llama.cpp-omni\\build\\bin\\Release\\llama-omni-server.exe",
+  "llama_model": "D:\\path\\to\\MiniCPM-o-gguf\\MiniCPM-o-4_5-Q4_K_M.gguf",
+
+  "_asr": "②③④ 链路的语音控制(8021 harness)用的 FunASR 流式模型目录",
+  "asr_model": "D:\\path\\to\\LocalASRmodel\\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+
+  "_glasses": "Rokid 链路要把 WiFi 传给 APK。不要把真实密码提交进仓库",
+  "glasses": {
+    "ssid": "YOUR_WIFI_SSID",
+    "psk": "YOUR_WIFI_PASSWORD"
   },
-  "gateway": {
-    "host": "127.0.0.1",
-    "bind_host": "0.0.0.0",
-    "port": 8040,
-    "tls": true,
-    "certfile": "certs/cert.pem",
-    "keyfile": "certs/key.pem",
-    "ready_timeout_s": 45
-  },
-  "demo": {
-    "ui_host": "127.0.0.1",
-    "ui_port": 8080,
-    "audio_endpoint": "/ws_audio",
-    "image_min_interval_s": 0.8,
-    "player_hostapi": "wasapi",
-    "player_prebuffer_ms": 200,
-    "connect_wait_s": 120,
-    "ready_timeout_s": 20
-  }
+
+  "_ports": "以下为当前 V2 链路的实际端口，仅供参考；panel.py 里已按此配置，改动需同步改 panel",
+  "worker": { "host": "127.0.0.1", "port": 22400 },
+  "gateway": { "host": "127.0.0.1", "port": 8006, "tls": true,
+               "certfile": "certs/cert.pem", "keyfile": "certs/key.pem" },
+  "llama": { "host": "127.0.0.1", "port": 22500 },
+  "harness": { "host": "127.0.0.1", "port": 8021 },
+  "demo": { "ui_port": 8080 }
 }

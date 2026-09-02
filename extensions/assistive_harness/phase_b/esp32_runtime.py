@@ -162,8 +162,13 @@ class TurnPrinter:
 _SENT_PUNCT = "，。！？,.!?"
 
 
-def _emit_chunk_img(web_ui, jpeg: bytes, idx: int, img_sent: bool, age_ms: int = 0):
-    """把一帧图推给 bridge_ui 第一视角（type=chunk, img_b64）。无客户端时零负担。"""
+def _emit_chunk_img(web_ui, jpeg: bytes, idx: int, img_sent: bool, age_ms: int = 0,
+                    reason: str = ""):
+    """把一帧图推给 bridge_ui 第一视角（type=chunk, img_b64）。无客户端时零负担。
+
+    img_sent=False 表示这帧没送模型（被漏斗拦下或不是 best）。第一视角照样显示，
+    这样画面才连续、也能看见"被拦的是什么样的图"——对演示④反而更有说服力。
+    """
     if web_ui is None or not getattr(web_ui, "live_clients", None):
         return
     try:
@@ -175,6 +180,7 @@ def _emit_chunk_img(web_ui, jpeg: bytes, idx: int, img_sent: bool, age_ms: int =
             "img_b64": b64,
             "img_sent": bool(img_sent),
             "img_age_ms": int(age_ms),
+            "reject_reason": reason or "",
         }))
     except Exception:
         pass
@@ -901,6 +907,7 @@ async def esp32_image_loop(
 
     # ── 强制措施状态 ──
     _funnel_stopped = False        # 是否已发过 funnel.stop（在停住态，等好图 resume）
+    _hint_playing = False          # 播报进行中（后台任务），期间不重复触发、不送图
     _last_hint_mono = 0.0          # 上次念提示的时刻（节流用）
     _HINT_THROTTLE_S = 5.0         # 同类连续 reject 的念提示节流间隔
     _pending_reject = None         # 标点保护：挂起中的 reject（等标点/超时再复查）
@@ -1020,7 +1027,24 @@ async def esp32_image_loop(
                         LOG.warning("[LIVE] on_funnel_round err: %s", e)
                 grab_ms = decision.timings.get("grab_ms", 0.0)
                 async def _do_reject_interrupt(reason):
-                    """真正执行打断：停 duplex → 播 wav → 恢复。"""
+                    """真正执行打断：停 duplex → 播 wav → 恢复。
+
+                    **在后台任务里跑，不能让 image_loop 同步等它**：
+                    里面有 sleep(0.35) + sleep(wav时长+0.2)，合计 3~4 秒。
+                    原来是在循环体里 await 的，这 3~4 秒内不抓图、不判定、
+                    **也不推第一视角** —— 画面走几帧就定住，正是 ④ 独有的现象。
+                    更糟的是它会自锁：播报拉长了帧间隔 → 光流按 4.7 秒的位移算 →
+                    同样的静止画面判成 severe_shake → 又播报 → 间隔又变长。
+                    改成后台跑之后，取图和推图照常，播报并行进行。
+                    """
+                    nonlocal _hint_playing
+                    _hint_playing = True
+                    try:
+                        await _do_reject_interrupt_inner(reason)
+                    finally:
+                        _hint_playing = False
+
+                async def _do_reject_interrupt_inner(reason):
                     wav_pcm = _load_reject_wav(reject_wav_dir, reason)
                     if wav_pcm is None:
                         LOG.warning("[强制措施] 无 %s.wav，跳过播报", reason)
@@ -1082,6 +1106,61 @@ async def esp32_image_loop(
                         pass
                     continue
 
+                # 第一视角：把这一轮采集到的**所有帧**都推出去，不管放没放行。
+                #   ★ 必须放在所有 reject 分支**之前** —— 持续坏那条末尾有 continue，
+                #     放在后面的话，④ 拒绝密集时整轮都跳过推图，画面就定住了。
+                #   只推 best 的话，④ 拦得多时画面会一卡一卡（实测就是这个现象）；
+                #   而且看不到"被拦的图长什么样"。整簇都推，画面连续，
+                #   前端还能按 img_sent / reject_reason 标出哪张真送了模型。
+                if web_ui is not None and getattr(web_ui, "live_clients", None):
+                    _all = list(decision.frames or [])
+                    _bi = decision.best_index if isinstance(decision.best_index, int) else -1
+                    if not _all and decision.best:
+                        _all, _bi = [decision.best], 0
+                    for _i, _f in enumerate(_all):
+                        _is_best_sent = bool(decision.send) and _i == _bi
+                        _emit_chunk_img(web_ui, _f, latest_frame.sequence,
+                                        _is_best_sent,
+                                        reason="" if decision.send else (decision.reason or ""))
+
+                if decision.send and decision.best:
+                    ts = now_ms()
+                    latest_frame.set(decision.best, ts)
+                    stats.image_count += 1
+                    await harness.send_frame(decision.best, latest_frame.sequence, ts)
+                    LOG.info("[漏斗] send (%s)", decision.reason)
+                    # -o record：只录真发送给模型的 best 图（chunk_idx = sequence）
+                    if live_rec is not None:
+                        try:
+                            await asyncio.to_thread(
+                                live_rec.on_frame, decision.best, latest_frame.sequence)
+                        except Exception as e:
+                            LOG.warning("[LIVE] on_frame err: %s", e)
+                    # 注意：send 不清 _pending_reject，保护期只看到标点那一刻
+                else:
+                    LOG.info("[漏斗] reject(%s) -> hint: %s",
+                             decision.reason, decision.hint)
+                    if live_rec is not None:
+                        live_rec.log_event("REJECT", f"{decision.reason} {decision.hint or ''}")
+                    if force_measure and speaker is not None and decision.reason != "need_focus":
+                        now_mono = time.monotonic()
+                        if _pending_reject is not None:
+                            pass  # 已在保护中，上面已处理，不重复挂起
+                        elif sent_tracker is not None and sent_tracker.speaking:
+                            # 模型正念字：挂起，保护到下一个标点再复查
+                            _pending_reject = {
+                                "since": now_mono,
+                                "reason": decision.reason,
+                                "snap": sent_tracker.snapshot(),
+                            }
+                            LOG.info("[标点保护] speak中，reject(%s)挂起，等语音播到标点或超时1.5s",
+                                     decision.reason)
+                        else:
+                            # 模型没念字（listen/静默）→ 无需保护，直接打断（受节流）
+                            if (not _hint_playing
+                                    and now_mono - _last_hint_mono >= _HINT_THROTTLE_S):
+                                _last_hint_mono = now_mono
+                                asyncio.create_task(_do_reject_interrupt(decision.reason))
                 # ── 「持续坏」检测（优先于标点保护）──
                 #   3s 窗口内"真坏"reject≥2 → 输出基于坏图=幻觉。此时不走标点保护
                 #   （前半也错，不值得保护），直接触发"停→播提示→恢复"。
@@ -1099,15 +1178,33 @@ async def esp32_image_loop(
                 if _bad_in_window >= _BAD_THRESH and _is_real_bad:
                     _pending_reject = None  # 持续坏优先，取消标点保护挂起
                     # 到这里必是"真坏"(severe_shake/unstable/too_dark/orient)。
-                    # 直接触发完整"停→播提示→恢复"（复用 _do_reject_interrupt，
-                    # 停模型输出不杀死、播完恢复）。耗时≈播报时长，天然间隔。
+                    # **必须和标点保护那条一样受 _HINT_THROTTLE_S 约束**：
+                    #   原注释说"耗时≈播报时长，天然间隔"，但那不成立 ——
+                    #   STOP/RESUME 是在播报**之前**就发出去的，不受播报时长限制。
+                    #   实测画面持续不合格时（晃动/倒置），3s 窗口每轮都能凑够 2 次真坏，
+                    #   于是每轮一次 STOP/RESUME；17 秒内 17 个 control event 之后
+                    #   gateway 会话直接换代重连（generation 0→1），期间
+                    #   gateway=preparing、音频队列堵死 queue=96 drops 暴涨、图也送不出去。
+                    #   表现就是"灯变红、画面卡住、取图 TimeoutError"。
+                    if _hint_playing or _now - _last_hint_mono < _HINT_THROTTLE_S:
+                        LOG.debug("[持续坏] %d次真坏，但距上次提示 %.1fs < %.1fs，跳过打断",
+                                  _bad_in_window, _now - _last_hint_mono,
+                                  _HINT_THROTTLE_S)
+                        elapsed = time.monotonic() - t0
+                        try:
+                            await asyncio.wait_for(stop_evt.wait(),
+                                                   timeout=max(0.0, interval_s - elapsed))
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+                    _last_hint_mono = _now
                     LOG.info("[持续坏] 3s内%d次真坏reject，打断+播提示（停→播→恢复）",
                              _bad_in_window)
                     if live_rec is not None:
                         live_rec.log_event(
                             "PERSIST-BAD",
                             f"3s内{_bad_in_window}次真坏 → 打断 ({decision.reason})")
-                    await _do_reject_interrupt(decision.reason)
+                    asyncio.create_task(_do_reject_interrupt(decision.reason))
                     elapsed = time.monotonic() - t0
                     try:
                         await asyncio.wait_for(stop_evt.wait(),
@@ -1139,51 +1236,14 @@ async def esp32_image_loop(
                             # 仍 reject → 打断（受节流约束）
                             LOG.info("[标点保护] %s，仍 reject(%s)，打断",
                                      "到标点" if reached else "超时1.5s", decision.reason)
-                            if now_mono - _last_hint_mono >= _HINT_THROTTLE_S:
+                            if (not _hint_playing
+                                    and now_mono - _last_hint_mono >= _HINT_THROTTLE_S):
                                 _last_hint_mono = now_mono
                                 _pending_reject = None
-                                await _do_reject_interrupt(decision.reason)
+                                asyncio.create_task(_do_reject_interrupt(decision.reason))
                             else:
                                 _pending_reject = None  # 被节流
 
-                if decision.send and decision.best:
-                    ts = now_ms()
-                    latest_frame.set(decision.best, ts)
-                    stats.image_count += 1
-                    await harness.send_frame(decision.best, latest_frame.sequence, ts)
-                    LOG.info("[漏斗] send (%s)", decision.reason)
-                    _emit_chunk_img(web_ui, decision.best, latest_frame.sequence, True)
-                    # -o record：只录真发送给模型的 best 图（chunk_idx = sequence）
-                    if live_rec is not None:
-                        try:
-                            await asyncio.to_thread(
-                                live_rec.on_frame, decision.best, latest_frame.sequence)
-                        except Exception as e:
-                            LOG.warning("[LIVE] on_frame err: %s", e)
-                    # 注意：send 不清 _pending_reject，保护期只看到标点那一刻
-                else:
-                    LOG.info("[漏斗] reject(%s) -> hint: %s",
-                             decision.reason, decision.hint)
-                    if live_rec is not None:
-                        live_rec.log_event("REJECT", f"{decision.reason} {decision.hint or ''}")
-                    if force_measure and speaker is not None and decision.reason != "need_focus":
-                        now_mono = time.monotonic()
-                        if _pending_reject is not None:
-                            pass  # 已在保护中，上面已处理，不重复挂起
-                        elif sent_tracker is not None and sent_tracker.speaking:
-                            # 模型正念字：挂起，保护到下一个标点再复查
-                            _pending_reject = {
-                                "since": now_mono,
-                                "reason": decision.reason,
-                                "snap": sent_tracker.snapshot(),
-                            }
-                            LOG.info("[标点保护] speak中，reject(%s)挂起，等语音播到标点或超时1.5s",
-                                     decision.reason)
-                        else:
-                            # 模型没念字（listen/静默）→ 无需保护，直接打断（受节流）
-                            if now_mono - _last_hint_mono >= _HINT_THROTTLE_S:
-                                _last_hint_mono = now_mono
-                                await _do_reject_interrupt(decision.reason)
                 if probe is not None:
                     since_last = (t0 - _last_grab_mono) * 1000.0 if _last_grab_mono else 0.0
                     jb = len(decision.best) if decision.best else 0
@@ -1473,7 +1533,21 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         if self._funnel is not None:
             try:
                 ms = await asyncio.to_thread(self._funnel.warmup_orient)
-                LOG.info("[预热] 方向分类器就绪 (首次 %.0fms，运行时应降到 ~10ms)", ms)
+                # 必须查真实状态：这行原来无条件打"就绪"，而加载失败时
+                # process_orientation 会静默回退到轻量 CV 判据、照样返回，
+                # 于是"预热就绪"根本不能证明分类器可用（实测 panel 环境下
+                # paddle 循环导入失败 → 轻量判据 → 第一轮就误判 orient_flipped）。
+                try:
+                    from .cam_pipeline_v2 import orient_classifier_status
+                    _ok, _err = orient_classifier_status()
+                except Exception:
+                    _ok, _err = True, ""
+                if _ok:
+                    LOG.info("[预热] 方向分类器就绪 (首次 %.0fms，运行时应降到 ~10ms)", ms)
+                else:
+                    LOG.warning(
+                        "[预热] !! PaddleOCR 方向分类器加载失败，已回退到轻量 CV 判据 —— "
+                        "orient 判定会明显变差（实测第一轮就误报 flipped）。原因: %s", _err)
             except Exception as e:
                 LOG.warning("[预热] 方向分类器预热跳过: %s", e)
         # ── rerun 模式：用录制的 session 回放（音频+best图）重跑 -o，不接实时设备 ──

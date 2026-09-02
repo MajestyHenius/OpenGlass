@@ -399,7 +399,12 @@ function updateHealth(e) {
   const sent = $('hSent');
   sent.classList.remove('good','warn','bad');
   if (e.img_sent) { sent.classList.add('good'); $('hSentText').textContent = '送图 ✓'; }
-  else { sent.classList.add('bad'); $('hSentText').textContent = '送图 ✗'; }
+  else {
+    // 没送模型：可能是被漏斗拦下（带 reject_reason），也可能只是同一轮里
+    // 非 best 的那几帧。画面照样刷新，这样第一视角才连续、也看得见被拦的图。
+    sent.classList.add('bad');
+    $('hSentText').textContent = e.reject_reason ? ('拦下 ' + e.reject_reason) : '送图 ✗';
+  }
 
   // 3) 音频静音
   const aud = $('hAud');

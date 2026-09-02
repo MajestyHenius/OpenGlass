@@ -169,7 +169,44 @@ CONFIG = {
             "--connect-retry",
         ],
 
-        # ⑤ rokid bridge —— 与 demo 平行、二选一的“第四个进程”。
+        # ⑤ 8021 harness —— 语音控制腿（停一下/重新开始/找物），也是 ASR 来源。
+        #    只有 ②③④ 带 harness 的链路才起它。
+        #    ★ 开源用户必改：--model-path 指向你机器上的 FunASR 流式模型目录 ★
+        #    证书：自签即可，只为过 wss 握手，不绑机器；客户端全是 CERT_NONE 不校验。
+        #    ★ 它在 extensions/ 下，用 -m 启动，因此 cwd 必须是 MiniCPM-o-Demo 目录
+        #      （见 _spawn 里的 name in (...) 白名单）。
+        "harness": [
+            "python", "-m", "extensions.assistive_harness.server", "--enabled",
+            #"--model-path", r"<PATH_TO>\LocalASRmodel\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+            # e.g.
+            "--model-path", (r"D:\OpenGlass\OmniDeployment\OpenGlass\LocalASRmodel"
+                             r"\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"),
+            "--port", "8021",
+            # 绝对路径：harness 的 cwd 是 OpenGlass 仓库根，而证书由 _ensure_certs
+            # 生成在 minicpm_demo_dir/certs 下（gateway 也用同一对）。
+            "--certfile", "{certfile}",
+            "--keyfile", "{keyfile}",
+        ],
+
+        # ⑥ demo_funnel —— esp32_runtime（harness + CV 漏斗）。与 ④ demo 互斥：
+        #    两者都要独占 ESP32 的音频 WS 和图像 TCP，不能同时跑。
+        #    这里只放各档位共用的参数；--esp32-host/--esp32-port/--rotate 由
+        #    devices.json 填（_device_args），漏斗档位参数由 _funnel_extra_args 追加。
+        #    ★ 同样在 extensions/ 下，cwd 必须是 MiniCPM-o-Demo 目录。
+        #    ★ 8006 是 TLS（https:// 能取到 openapi.json，http:// 是 Empty reply），
+        #      走默认 wss，**不要**加 --no-tls；而 harness 8021 是自签 wss，两者都是 wss
+        #      但证书来源不同。
+        "demo_funnel": [
+            "python", "-m", "extensions.assistive_harness.phase_b.esp32_runtime",
+            "--gateway", "localhost:8006",
+            "--harness-url", "wss://127.0.0.1:8021/ws/control",
+            "--image-tcp-port", "5000",
+            "--web-ui-port", "8080",
+            "--record-live",
+            "--prompt", "{prompt}",
+        ],
+
+        # ⑦ rokid bridge —— 与 demo 平行、二选一的“第四个进程”。
         #    注意：它不是客户端去连眼镜，而是在 PC 上开 18080 端口等 APK 连进来。
         #    ★ 用 v8（API V2）。v7 是旧协议(/ws/duplex)，连不上新 gateway:8006。
         #    ★ run_rokid.ps1 / run_rokid_wifi.cmd 已不再需要——它们做的事
@@ -191,8 +228,12 @@ CONFIG = {
             # live.html 观测页（与 ESP32 demo 同一套 bridge_ui 前端/模板）
             "--ui-port", "8080",
             "--prompt", "{prompt}",
-            "--glasses-ssid", "SQZ",
-            "--glasses-psk", "sqz.ac.cn",
+            # ★ 眼镜连的 WiFi。**不要把真实密码提交进仓库** ——
+            #   在 panel.py 同目录放一个 panel.local.json（已在 .gitignore）：
+            #     { "glasses_ssid": "你的WiFi", "glasses_psk": "你的密码" }
+            #   没有该文件时用下面的占位值，Rokid 链路会连不上 WiFi 但其余功能正常。
+            "--glasses-ssid", "{glasses_ssid}",
+            "--glasses-psk", "{glasses_psk}",
         ],
     },
 
@@ -202,12 +243,47 @@ CONFIG = {
     #   rokid → rokid_minicpm_v7.py      （PC 开端口等 APK 连进来，无 device）
     "chains": {
         "esp32": {
-            "label": "ESP32 眼镜",
+            "label": "① 基础对话",
             "tail": "demo",                      # 第四级进程名
             "start_order": ["llama", "worker", "gateway", "demo"],
             "stop_order":  ["demo", "gateway", "worker", "llama"],
             "need_device": True,                 # 显示眼镜下拉
             "fpv_key": "fpv_url",                # 第一视角地址
+        },
+        # ── 以下三条走 esp32_runtime（harness + 漏斗），四档递进演示 ──
+        #   ① 基础对话 = 上面的 "esp32"（esp32_bridge.py，无 harness 无漏斗）
+        #   ② 语音控制 = harness 开、漏斗关
+        #   ③ 质量筛选 = ② + 每秒多帧里挑最清晰的一张
+        #   ④ 完整防幻觉 = ③ + 坏图直接拦下并语音提示
+        #   每档只比上一档多一件事：看到什么说什么 → 能听懂指令 → 图会挑 → 坏图会拦
+        #   （没有"只对焦"这一档：对焦后要等 settle 再重抓，1s chunk 时序固定，
+        #     对焦后那张未必赶得上这一轮，等于花了时间没用上。）
+        "esp32_voice": {
+            "label": "② 语音控制",
+            "tail": "demo_funnel",
+            "funnel": 0,                         # 漏斗档位：0 关 / 2 选图 / 3 选图+拒绝
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
+        },
+        "esp32_select": {
+            "label": "③ 质量筛选",
+            "tail": "demo_funnel",
+            "funnel": 2,
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
+        },
+        "esp32_full": {
+            "label": "④ 完整防幻觉",
+            "tail": "demo_funnel",
+            "funnel": 3,
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
         },
         "rokid": {
             "label": "Rokid 眼镜",
@@ -219,6 +295,30 @@ CONFIG = {
         },
     },
     "default_chain": "esp32",
+
+    # 判据档位：漏斗的两套标定参数。对外用场景名，不暴露内部值。
+    #   严格 = medicine  （药盒小字高危，worst_x0=6.5 ACCEPT_Q=0.55）
+    #   日常 = stationery（生活用品，worst_x0=5.0 ACCEPT_Q=0.48）
+    "scenes": {"严格判据": "medicine", "日常判据": "stationery"},
+    "default_scene": "严格判据",
+
+    # 档位④的提示音目录。**跟着 extensions 包走**（和 bridge_ui 的 templates/ 同思路），
+    # 不落在上游 MiniCPM-o-Demo 里，保持三仓库独立。这里是相对 OpenGlass 仓库根，
+    # panel 会拼成绝对路径传给 esp32_runtime（它的 cwd 是上游，相对路径会指错地方）。
+    # 启动前检查，缺了就报错 —— 而不是跑起来才发现没声音，那时 duplex 已在跑，
+    # 没法当场用 gen_reject_wavs.py 生成。
+    "reject_wav_dir": "extensions/assistive_harness/phase_b/assets/reject_wav",
+
+    # 进程的界面显示名（灯泡/日志页签用）。内部名不变，只影响 UI。
+    "proc_labels": {
+        "llama": "推理后端",
+        "worker": "worker",
+        "gateway": "gateway",
+        "harness": "语音控制(8021)",
+        "demo": "眼镜",
+        "demo_funnel": "眼镜+漏斗",
+        "rokid": "Rokid",
+    },
 
     # 可选眼镜（对应 devices.json 里的 name）。面板顶部下拉选择。仅 ESP32 分支用。
     "devices": ["左镜", "右镜", "备用镜"],
@@ -278,6 +378,191 @@ if _names:
 
 
 # ============================================================================
+def _load_device_map(path="devices.json"):
+    """读整份设备表：name -> {host, port, rotate}。
+
+    原来只取 name（下拉用）。但 esp32_bridge 自己读 json（--device-config），
+    而 esp32_runtime 不读，它只认 --esp32-host/--esp32-port/--rotate，
+    所以由 panel 把这几项取出来填。rotate 尤其不能漏：摄像头物理侧装，
+    不转正的话漏斗的方向检测会把"相机侧装"误判成"用户把盒子拿反了"。
+    utf-8-sig：记事本/VSCode 存的 json 可能带 BOM，用 utf-8 读会炸在第一个字符。
+    """
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        for d in data.get("devices", []):
+            n = d.get("name")
+            if not n:
+                continue
+            out[n] = {
+                "host": d.get("esp32_host", ""),
+                "port": int(d.get("esp32_port", 80)),
+                "rotate": int(d.get("rotate", 0)) % 360,
+            }
+    except FileNotFoundError:
+        print(f"[panel] 未找到 {path}，带漏斗的链路(②③④)将无法自动填 IP")
+    except Exception as e:
+        print(f"[panel] 读取 {path} 失败({e})")
+    return out
+
+
+CONFIG["device_map"] = _load_device_map(_dev_path)
+if CONFIG["device_map"]:
+    print("[panel] 设备详情: " + ", ".join(
+        f"{k}({v['host']} rot={v['rotate']})" for k, v in CONFIG["device_map"].items()))
+
+
+def _load_runtime_local():
+    """读 runtime.local.json —— 本机路径与私密配置，**不进仓库**。
+
+    为什么要它：panel.py 里原本写死了五处本机绝对路径
+    （conda 环境、MiniCPM-o-Demo 目录、llama-omni-server.exe、主 gguf、FunASR 模型），
+    还有眼镜 WiFi 的明文密码。开源后每个人都要改源码才能跑，密码也会进 git 历史。
+    改成从这个文件读，clone 下来只需 `cp runtime.example.json runtime.local.json` 再填。
+
+    键名沿用仓库里已有的 runtime.example.json 风格。
+    找不到文件时保留 CONFIG 里的默认值（也就是原来的写死值），行为不变。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    f = os.path.join(here, "runtime.local.json")
+    if not os.path.isfile(f):
+        print(f"[panel] 未找到 {f}")
+        print("[panel]   请复制 runtime.example.json 为 runtime.local.json 并填写本机路径；")
+        print("[panel]   否则将沿用 panel.py 里的默认值（多半不是你的路径）。")
+        return {}
+    try:
+        with open(f, "r", encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except Exception as e:
+        print(f"[panel] 读取 runtime.local.json 失败({e})，沿用默认值")
+        return {}
+
+    def _expand(v):
+        return os.path.expandvars(os.path.expanduser(v)) if isinstance(v, str) else v
+
+    n = 0
+    # ① 简单键 -> CONFIG 顶层
+    for src_key, dst_key in (("conda_env", "conda_env"),
+                             ("minicpm_demo_root", "minicpm_demo_dir")):
+        v = _expand(cfg.get(src_key))
+        if v:
+            CONFIG[dst_key] = v
+            n += 1
+    # ② 需要替换到命令行数组里的
+    def _sub(proc, old_pred, new_val):
+        """把 procs[proc] 里满足 old_pred 的那一项换成 new_val。"""
+        arr = CONFIG["procs"].get(proc)
+        if not arr or not new_val:
+            return 0
+        for i, x in enumerate(arr):
+            if isinstance(x, str) and old_pred(x):
+                arr[i] = new_val
+                return 1
+        return 0
+
+    n += _sub("llama", lambda x: x.lower().endswith("llama-omni-server.exe")
+              or x.lower().endswith("llama-omni-server"),
+              _expand(cfg.get("llama_server")))
+    n += _sub("llama", lambda x: x.lower().endswith(".gguf"),
+              _expand(cfg.get("llama_model")))
+    n += _sub("harness", lambda x: "speech_paraformer" in x or "LocalASRmodel" in x,
+              _expand(cfg.get("asr_model")))
+    print(f"[panel] 已读入 runtime.local.json（生效 {n} 项）")
+    return cfg
+
+
+def _load_local_secrets(rt):
+    """眼镜 WiFi（Rokid 链路传给 APK）。同样来自 runtime.local.json，
+    写死在 panel.py 里就等于明文密码进公开仓库。"""
+    out = {"glasses_ssid": "<YOUR_WIFI_SSID>", "glasses_psk": "<YOUR_WIFI_PASSWORD>"}
+    g = (rt or {}).get("glasses") or {}
+    for k in ("glasses_ssid", "glasses_psk"):
+        v = g.get(k.replace("glasses_", "")) or (rt or {}).get(k)
+        if v:
+            out[k] = v
+    return out
+
+
+_RTLOCAL = _load_runtime_local()
+CONFIG["local"] = _load_local_secrets(_RTLOCAL)
+
+
+def _ensure_certs(base_dir):
+    """确保 certs/cert.pem + key.pem 存在，没有就自签一对。
+
+    gateway(8006) 和 harness(8021) 都用这一对（gateway.py 的默认值就是
+    certs/cert.pem，缺了会直接报错退出），所以四条链路都需要它。
+    自签证书**不绑机器**，里面没有硬件信息；客户端全是 CERT_NONE 不校验，
+    只是为了让 wss 握手能过。所以本地生成一份即可，不必也不该提交进仓库。
+
+    优先用 cryptography 库；没装就退回调 openssl；都不行就打出手动命令。
+    """
+    if not base_dir or not os.path.isdir(base_dir):
+        return False
+    d = os.path.join(base_dir, "certs")
+    cert = os.path.join(d, "cert.pem")
+    key = os.path.join(d, "key.pem")
+    if os.path.isfile(cert) and os.path.isfile(key):
+        return True
+    os.makedirs(d, exist_ok=True)
+    print(f"[panel] 未找到证书，正在生成自签证书 -> {d}")
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime as _dt
+
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = _dt.datetime.now(_dt.timezone.utc)
+        crt = (x509.CertificateBuilder()
+               .subject_name(name).issuer_name(name)
+               .public_key(k.public_key())
+               .serial_number(x509.random_serial_number())
+               .not_valid_before(now - _dt.timedelta(days=1))
+               .not_valid_after(now + _dt.timedelta(days=3650))
+               .add_extension(x509.SubjectAlternativeName([
+                   x509.DNSName("localhost"),
+                   x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1")),
+               ]), critical=False)
+               .sign(k, hashes.SHA256()))
+        with open(key, "wb") as f:
+            f.write(k.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()))
+        with open(cert, "wb") as f:
+            f.write(crt.public_bytes(serialization.Encoding.PEM))
+        print("[panel] 证书已生成（cryptography，有效期 10 年）")
+        return True
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[panel] cryptography 生成失败({e})，改试 openssl")
+
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+             "-keyout", key, "-out", cert, "-days", "3650",
+             "-nodes", "-subj", "/CN=localhost"],
+            check=True, capture_output=True, timeout=60)
+        print("[panel] 证书已生成（openssl，有效期 10 年）")
+        return True
+    except Exception as e:
+        print(f"[panel] !! 自动生成证书失败: {e}")
+        print(f"[panel]    请手动执行（在 {base_dir} 下）：")
+        print("[panel]    openssl req -x509 -newkey rsa:2048 "
+              "-keyout certs/key.pem -out certs/cert.pem "
+              "-days 3650 -nodes -subj \"/CN=localhost\"")
+        return False
+
+
+_ensure_certs(CONFIG.get("minicpm_demo_dir") or CONFIG.get("cwd"))
+
+
 class ProcManager:
     """管理三个子进程：起停、状态轮询、日志收集、端口/就绪探测。"""
 
@@ -294,6 +579,7 @@ class ProcManager:
         self.status = {n: "stopped" for n in cfg["procs"]}  # stopped/starting/running/crashed
         self.current_prompt = next(iter(cfg["presets"].values()))
         self.current_device = (cfg.get("devices") or ["默认"])[0]
+        self.current_scene = cfg.get("default_scene", "严格判据")
         # —— 当前链路：esp32 / rokid，决定第四级起哪个进程 ——
         self.current_chain = cfg.get("default_chain", "esp32")
         self._lock = threading.Lock()
@@ -341,8 +627,28 @@ class ProcManager:
         if name == "demo":
             subst = {"{prompt}": self.current_prompt, "{device}": self.current_device}
             cmd = [subst.get(x, x) for x in cmd]
-        elif name == "rokid":
+        elif name == "harness":
+            # 证书用绝对路径：harness 的 cwd 是 OpenGlass 仓库根，
+            # 而证书由 _ensure_certs 生成在 minicpm_demo_dir/certs 下（gateway 共用）。
+            _base = self.cfg.get("minicpm_demo_dir") or "."
+            subst = {
+                "{certfile}": os.path.join(_base, "certs", "cert.pem"),
+                "{keyfile}": os.path.join(_base, "certs", "key.pem"),
+            }
+            cmd = [subst.get(x, x) for x in cmd]
+        elif name == "demo_funnel":
+            # esp32_runtime：prompt + 设备参数(IP/端口/旋转) + 漏斗档位
             subst = {"{prompt}": self.current_prompt}
+            cmd = [subst.get(x, x) for x in cmd]
+            cmd += self._device_args()
+            cmd += self._funnel_extra_args()
+        elif name == "rokid":
+            _loc = self.cfg.get("local", {})
+            subst = {
+                "{prompt}": self.current_prompt,
+                "{glasses_ssid}": _loc.get("glasses_ssid", ""),
+                "{glasses_psk}": _loc.get("glasses_psk", ""),
+            }
             cmd = [subst.get(x, x) for x in cmd]
             cmd += self._rokid_extra_args()   # 内联 ps1 的 --enable-funasr 分支
         return self._wrap_conda(cmd)
@@ -436,6 +742,110 @@ class ProcManager:
         self._log("rokid", f"日志: {env['ROKID_V7_LOG_FILE']}")
         return env
 
+    def _device_args(self):
+        """从 devices.json 取当前眼镜的 IP / 端口 / 旋转角，填给 esp32_runtime。"""
+        d = (self.cfg.get("device_map") or {}).get(self.current_device)
+        if not d or not d.get("host"):
+            self._log("demo_funnel",
+                      f"!! devices.json 里找不到「{self.current_device}」的 esp32_host")
+            return []
+        args = ["--esp32-host", d["host"], "--esp32-port", str(d.get("port", 80))]
+        if d.get("rotate"):
+            args += ["--rotate", str(d["rotate"])]
+        return args
+
+    def _funnel_extra_args(self):
+        """按链路的档位追加漏斗参数。
+
+            0  语音控制    不加 → 走 no_funnel 分支，每轮取一帧直发
+            2  质量筛选    --funnel --no-reject → 选 best 但永远放行
+            3  完整防幻觉  --funnel --force-measure → 选 best + 拒绝 + 语音提示
+        """
+        lv = int(self.chain().get("funnel", 0))
+        if lv <= 0:
+            return []
+        scene = self.cfg["scenes"].get(self.current_scene, "medicine")
+        args = ["--funnel", "--scene", scene]
+        if lv == 2:
+            args += ["--no-reject"]
+        else:
+            args += ["--force-measure", "--reject-wav-dir", self._reject_wav_dir()]
+        return args
+
+    def _check_deps(self):
+        """②③④ 启动前检查关键依赖，缺了就说清楚缺什么、怎么装。
+
+        为什么值得单独查：paddleocr 装不上时，方向分类器会**静默回退**到
+        早期的简易判据，表现是画面明明是正的却一直报"画面好像反了"、
+        接着播报把帧间隔拉长又误报"晃动" —— 全程不报错，极难定位。
+        实测踩过：panel 在没装好 paddle 的环境里启动，一上来就全是 orient_flipped。
+        """
+        lv = int(self.chain().get("funnel", 0))
+        need = [("aiohttp", "aiohttp"), ("numpy", "numpy"),
+                ("PIL", "Pillow"), ("sounddevice", "sounddevice")]
+        if self.chain().get("tail") == "demo_funnel":
+            need += [("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
+                     ("yaml", "PyYAML"), ("funasr", "funasr")]
+        if lv >= 2:
+            need += [("cv2", "opencv-python")]
+        if lv >= 3 or lv == 2:
+            need += [("paddle", "paddlepaddle"), ("paddleocr", "paddleocr")]
+        import importlib.util as _iu
+        missing = [pip for mod, pip in need if _iu.find_spec(mod) is None]
+        if missing:
+            tail = self.chain().get("tail") or "demo"
+            self._log(tail, "!! 缺少依赖: " + ", ".join(missing))
+            self._log(tail, "   请在**启动 panel 的那个 conda 环境**里安装：")
+            self._log(tail, "     pip install " + " ".join(missing))
+            self._log(tail, "   （完整清单见 extensions/requirements-phase-b.txt）")
+            return False
+        return True
+
+    def _check_extensions(self):
+        """②③④ 需要 OpenGlass 仓库内的 extensions/ 包完整。
+
+        不需要复制到别处 —— _spawn 把 cwd 设成 OpenGlass 仓库根。
+        缺文件时子进程会起来立刻死、日志里一行 No module named extensions，
+        面板上只看到灯变红，所以提前拦住并说清楚。
+        """
+        if self.chain().get("tail") != "demo_funnel":
+            return True
+        f = os.path.join(self._repo_root(), "extensions", "assistive_harness",
+                         "phase_b", "esp32_runtime.py")
+        if not os.path.isfile(f):
+            self._log("demo_funnel",
+                      f"!! 未找到 {f}\n"
+                      f"   ②③④ 需要仓库内的 extensions/ 包，请确认它没有被删除或移动。")
+            return False
+        return True
+
+    def _repo_root(self):
+        """OpenGlass 仓库根（panel.py 在 runtime/openglass_omni/ 下，往上三级）。"""
+        return os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+
+    def _reject_wav_dir(self):
+        d = self.cfg.get("reject_wav_dir",
+                         "extensions/assistive_harness/phase_b/assets/reject_wav")
+        return d if os.path.isabs(d) else os.path.join(self._repo_root(), d)
+
+    def _check_reject_wav(self):
+        """档位④要播提示音，wav 必须事先用 gen_reject_wavs.py 生成好
+        （且要在 duplex 没跑的时候生成）。这里只检查，不在面板里现场生成。"""
+        if int(self.chain().get("funnel", 0)) < 3:
+            return True
+        full = self._reject_wav_dir()
+        try:
+            n = len([x for x in os.listdir(full) if x.lower().endswith(".wav")])
+        except Exception:
+            n = 0
+        if n == 0:
+            self._log("demo_funnel",
+                      f"!! {full} 里没有 wav。档位④要播提示音，"
+                      f"请先在 duplex 未运行时跑 gen_reject_wavs.py 生成。")
+            return False
+        return True
+
     def _rokid_extra_args(self):
         """按配置追加参数（对应 ps1 里的 $bridgeArgs += ...）。"""
         extra = []
@@ -524,7 +934,18 @@ class ProcManager:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         # worker / gateway 是上游 MiniCPM-o-Demo 的文件（worker.py / gateway.py），
         # 必须在那个目录下启动才能找到。llama / demo / rokid 用的是绝对路径，不依赖 cwd。
-        if name in ("worker", "gateway"):
+        # harness / demo_funnel 用 `python -m extensions...` 启动，
+        # **cwd 必须是 OpenGlass 仓库根** —— extensions/ 就在它下面。
+        #   ★ 不要用 PYTHONPATH 代替：`-m` 时 sys.path[0] 是 cwd，cwd 优先于
+        #     PYTHONPATH。如果 cwd 设成 MiniCPM-o-Demo 而那边**也有**一份
+        #     extensions/，OpenGlass 这份会被完全遮蔽（改了不生效）；
+        #     更糟的是 PYTHONPATH 把 OpenGlass 根塞进 sys.path，实测导致
+        #     paddle 导入失败（partially initialized module 'paddle' ...
+        #     circular import）→ 方向分类器加载失败 → 回退到错误的早期 CV 判据
+        #     → 第一轮就误报 orient_flipped，然后播报拉长帧间隔又误报 severe_shake。
+        if name in ("harness", "demo_funnel"):
+            _cwd = self._repo_root()
+        elif name in ("worker", "gateway"):
             _cwd = self.cfg.get("minicpm_demo_dir") or self.cfg.get("cwd") or None
             if not _cwd:
                 self._log(name, "!! 未配置 minicpm_demo_dir（MiniCPM-o-Demo 目录），"
@@ -676,6 +1097,21 @@ class ProcManager:
                 self._log(name, "就绪(关键字命中)，放行")
                 return True
             elapsed = time.time() - t_start
+            if name == "harness":
+                # 8021 是自签 wss，不能用 HTTP health，只能探 TCP 端口。
+                # 而且端口开了之后 /ws/control 还要一小会儿才绑好，
+                # 不等的话 esp32_runtime 连过去会失败。
+                if self._port_open(8021):
+                    self._log("harness", "8021 端口已开，再等 2s 让 /ws/control 绑好")
+                    time.sleep(2.0)
+                    self._log("harness", "harness 就绪，放行")
+                    return True
+                _now = time.time()
+                if _now - last_log > 5:
+                    last_log = _now
+                    self._log("harness", f"等待 8021 (FunASR 模型加载中) {elapsed:.0f}s")
+                time.sleep(1.0)
+                continue
             if name == "llama":
                 # llama-omni-server：轮询 /health 返回 200 才放行（= 你手动的 curl .../health）
                 if self._http_ok(llama_url):
@@ -775,6 +1211,11 @@ class ProcManager:
         return [c["tail"] for k, c in self.cfg["chains"].items() if c["tail"] != cur]
 
     def _do_start_all(self):
+        # ②③④ 的两个前置检查：extensions 复制了没、档位④的 wav 有没有。
+        # 提前拦住比跑起来才发现好 —— 后者时 duplex 已在跑，没法当场补。
+        if (not self._check_extensions() or not self._check_deps()
+                or not self._check_reject_wav()):
+            return
         """按序补齐：只起没在跑的，已在跑的跳过；被急停立即停下。"""
         # 切链后若另一条链的尾巴还活着，先杀掉——两个客户端同时占一个 gateway
         # 会互相抢 session，必须互斥。
@@ -940,24 +1381,34 @@ class Api:
                 "need_device": c["need_device"],
                 "fpv_url": self.cfg.get(c["fpv_key"], ""),
                 "procs": c["start_order"],
+                # 只有开了漏斗的链路(③④)才需要选判据档位；①②选了也不起作用
+                "need_scene": int(c.get("funnel", 0)) > 0,
             }
         return {
             "presets": self.cfg["presets"],
             "fpv_url": self.cfg["fpv_url"],
             "devices": self.cfg.get("devices", []),
             "chains": chains,
+            "scenes": list(self.cfg.get("scenes", {}).keys()),
+            "default_scene": self.cfg.get("default_scene", ""),
+            "proc_labels": self.cfg.get("proc_labels", {}),
             "default_chain": self.cfg.get("default_chain", "esp32"),
         }
 
     def set_chain(self, chain):
         return self.mgr.set_chain(chain)
 
+    def set_scene(self, scene):
+        if scene:
+            self.mgr.current_scene = scene
+        return "ok"
+
     def set_device(self, device):
         if device:
             self.mgr.current_device = device
         return "ok"
 
-    def start_all(self, prompt=None, device=None, chain=None):
+    def start_all(self, prompt=None, device=None, chain=None, scene=None):
         # prompt 来自前端文本框（用户选的 preset 或编辑后的内容）。在起进程前更新
         # current_prompt，否则一键启动只会用初始的第一个 preset。
         if prompt:
@@ -966,6 +1417,8 @@ class Api:
             self.mgr.set_chain(chain)
         if device:
             self.mgr.current_device = device
+        if scene:
+            self.mgr.current_scene = scene
         self.mgr.start_all(); return "ok"
 
     def stop_all(self):

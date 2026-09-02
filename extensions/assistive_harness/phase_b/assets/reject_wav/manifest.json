@@ -1,0 +1,92 @@
+{
+  "no_frames": {
+    "text": "没有拿到画面，请稍等",
+    "wav": "no_frames.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "没有拿到画面，请稍等",
+    "dur": 2.2
+  },
+  "severe_shake": {
+    "text": "画面晃得厉害，请保持不动",
+    "wav": "severe_shake.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "画面晃得厉害，请保持不动",
+    "dur": 2.96
+  },
+  "unstable": {
+    "text": "画面还在晃动，请拿稳",
+    "wav": "unstable.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "画面还在晃动，请拿稳",
+    "dur": 3.04
+  },
+  "too_dark": {
+    "text": "光线太暗，请到亮一点的地方",
+    "wav": "too_dark.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "光线太暗，请到亮一点的地方",
+    "dur": 2.76
+  },
+  "aimed_wrong": {
+    "text": "好像没对准，请对准目标",
+    "wav": "aimed_wrong.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "好像没对准，请对准目标",
+    "dur": 2.96
+  },
+  "need_focus": {
+    "text": "对焦中，请拿稳一下",
+    "wav": "need_focus.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "对焦中，请拿稳一下",
+    "dur": 2.36
+  },
+  "orient": {
+    "text": "画面好像反了，请倒过来",
+    "wav": "orient.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "画面好像反了，请倒过来",
+    "dur": 3.4
+  },
+  "orient_flipped": {
+    "text": "画面好像反了，请倒过来",
+    "wav": "orient_flipped.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "画面好像反了，请倒过来",
+    "dur": 3.4
+  },
+  "orient_sideways": {
+    "text": "画面好像歪了，请摆正",
+    "wav": "orient_sideways.wav",
+    "strict_pass": true,
+    "text_match": true,
+    "sr_ok": true,
+    "dur_ok": true,
+    "text_out": "画面好像歪了，请摆正",
+    "dur": 2.44
+  }
+}

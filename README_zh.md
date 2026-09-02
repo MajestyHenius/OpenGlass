@@ -92,7 +92,7 @@ flowchart LR
 
 控制面板的目标是：完成一次性环境准备后，后续实验可以一键重复启动。它不会替用户下载模型权重、clone 上游仓库、编译 `llama.cpp-omni` 或烧录 ESP32。
 
-> **当前全新 clone 状态：** 可以从仓库根目录启动面板 UI，但当前启动器仍从 `runtime/openglass_omni/panel.py` 读取机器专属路径。仓库已有的 `runtime.local.json` 加载器尚未接入该面板。请按照下面列出的实际生效位置配置；在完成下一轮代码修改前，还不能把它称为可移植的一键安装。
+> **当前全新 clone 状态：** 面板本身可以从仓库根目录直接启动,但整套链路仍需手动准备四样仓库外的资源:`llama.cpp-omni` 编译结果、MiniCPM-o GGUF 权重、FunASR 模型、以及 ESP32 固件里的 Wi-Fi 凭据。这几项都不在本仓库内,需按以下说明安装。
 
 ### 1. 前置条件
 
@@ -107,11 +107,11 @@ flowchart LR
 
 本仓库不分发模型权重。
 
-### 2. Clone V2 上游项目的 master 分支
+### 2. Clone 上游项目的 master 分支
 
 三个仓库必须保持相互独立，不要把 OpenSQZ Glass 的文件复制进 MiniCPM-o-Demo。
 
-当前公开启动器采用 V2 四进程链路：`llama-omni-server` -> `worker` -> `gateway` -> `demo`，对应两个上游项目仍在维护的 `master` 分支。WAIC 演示使用的 V1 三进程链路由 `worker` 自行启动 `llama-server`，属于历史运行方案，不再作为本 README 的默认安装路径。
+当前公开启动器采用与面壁同步的四进程链路：`llama-omni-server` -> `worker` -> `gateway` -> `demo`，对应两个上游项目仍在维护的 `master` 分支。
 
 ```powershell
 git clone --branch master https://github.com/tc-mb/llama.cpp-omni.git
@@ -128,7 +128,12 @@ cd ..
 git clone https://github.com/OpenSQZ/OpenGlass.git
 cd OpenGlass
 python -m pip install -r runtime/openglass_omni/requirements.txt
+
+python -m pip install -r extensions/requirements-phase-b.txt   # 语音控制 + CV 漏斗（harness链路需要，只跑基础对话无需安装）
+
 ```
+
+
 
 由于上游 `master` 分支会持续变化，每次完成 OpenSQZ Glass 运行时验证和正式发布时，都应记录实际测试过的 Commit SHA。上游更新可能改变端口、启动参数、通信协议、TTS 行为或进程所有权。
 
@@ -177,17 +182,32 @@ Copy-Item examples/configs/devices.example.json runtime/openglass_omni/devices.j
 
 ### 5. 配置当前启动器
 
-当前版本真正生效的是以下配置：
+把 [`runtime.example.json`](runtime/openglass_omni/runtime.example.json) 复制为
+同目录下的 `runtime.local.json`，填写本机路径。面板启动时读取它，
+用其中的值覆盖 `panel.py` 里的默认路径：
 
-| 配置内容 | 当前实际生效位置 | 应填写的值 |
+```json
+{
+  "conda_env": null,
+  "minicpm_demo_root": "D:\\path\\to\\MiniCPM-o-Demo",
+  "llama_server": "D:\\path\\to\\llama.cpp-omni\\build\\bin\\Release\\llama-omni-server.exe",
+  "llama_model": "D:\\path\\to\\MiniCPM-o-gguf\\MiniCPM-o-4_5-Q4_K_M.gguf",
+  "asr_model": "D:\\path\\to\\LocalASRmodel\\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+  "glasses": { "ssid": "你的WiFi", "psk": "你的WiFi密码" }
+}
+```
+
+| 配置内容 | 位置 | 说明 |
 | --- | --- | --- |
-| MiniCPM-o-Demo 目录 | [`panel.py` 的 `CONFIG["minicpm_demo_dir"]`](runtime/openglass_omni/panel.py) | 包含上游 `worker.py` 和 `gateway.py` 的绝对路径 |
-| `llama-omni-server` | [`panel.py` 的 `CONFIG["procs"]["llama"]`](runtime/openglass_omni/panel.py) | `llama.cpp-omni/build` 下的编译结果 |
-| 主 GGUF 模型 | 同一条 `llama` 命令中 `-m` 后的位置 | MiniCPM-o 4.5 主 GGUF 的绝对路径 |
+| MiniCPM-o-Demo 目录 | `runtime.local.json` 的 `minicpm_demo_root` | 包含上游 `worker.py` / `gateway.py` 的绝对路径 |
+| `llama-omni-server` | `llama_server` | `llama.cpp-omni/build` 下的编译结果 |
+| 主 GGUF 模型 | `llama_model` | MiniCPM-o 4.5 主 GGUF 的绝对路径 |
+| ASR 模型 | `asr_model` | FunASR 流式模型目录，②③④ 链路的语音控制用 |
+| 眼镜 Wi-Fi | `glasses.ssid` / `glasses.psk` | Rokid 链路启动 APK 时传入；留空则该链路连不上眼镜，其余链路不受影响 |
 | 眼镜名称/IP/旋转角 | `runtime/openglass_omni/devices.json` | 每副 ESP32 眼镜一条记录 |
-| Prompt 预设 | [`panel.py` 的 `CONFIG["presets"]`](runtime/openglass_omni/panel.py) | 当前面板中显示的交互 Prompt |
+| Prompt 预设 | [`panel.py` 的 `CONFIG["presets"]`](runtime/openglass_omni/panel.py) | 面板中显示的交互 Prompt |
 
-[`runtime.example.json`](runtime/openglass_omni/runtime.example.json) 和 [`prompts.json`](runtime/openglass_omni/prompts.json) 描述了我们准备采用的本地配置边界，但当前面板还没有读取这两个文件。把 runtime 示例复制为 `runtime.local.json` **还不能替代** `panel.py` 中写死的路径和 Prompt。这是已知的集成问题，不是用户配置错误。
+> 面板首次启动时会在 `<minicpm_demo_root>/certs/` 下自签一对 TLS 证书,供 gateway(8006)和语音控制 harness(8021)的 `wss` 连接使用。
 
 ### 6. 配置并烧录 Wi-Fi 固件
 
@@ -203,16 +223,35 @@ Copy-Item examples/configs/devices.example.json runtime/openglass_omni/devices.j
 python glasses_panel.py
 ```
 
-选择 **ESP32 眼镜**，再选择设备名称并点击 **一键启动**。当前面板会尝试依次启动：
+在顶部选择**链路**、**眼镜**（③④ 还要选**判据**），点击 **一键启动**。
+
+面板提供五条链路，其中 ESP32 的四档是递进的，每一档只比上一档多一件事：
+
+| 链路 | 功能 | 启动的进程 |
+| --- | --- | --- |
+| ① 基础对话 | 通过眼镜与本地模型全模态双工对话 | llama → worker → gateway → esp32_bridge |
+| ② 语音控制 | 能听懂「停一下 / 重新开始 / 找东西」 | llama → worker → gateway → harness→esp32_bridge |
+| ③ 质量筛选 | 每秒多帧里挑最清晰的一张送模型 | 同 ② |
+| ④ 完整防幻觉 | 坏图直接拦下并语音提示，不让模型看见 | 同 ② |
+| Rokid | 反向链路，PC 开 18080 等 APK 连入 | llama → worker → gateway → rokid |
+
+①～④ 是**互斥**的：它们都要独占眼镜的音频通道和图像端口，同一时间只能跑一条。
 
 ```text
 llama-omni-server :22500
         -> worker :22400
         -> gateway :8006
-        -> ESP32 bridge / 本地画面 :8080
+        -> （②③④ 才有）harness :8021
+        -> 眼镜客户端 / 第一视角 :8080
 ```
 
-只有四个进程指示灯全部变绿，并且第一视角持续更新，才能说明链路就绪。只看到面板 UI 打开，不能证明模型、声音、图像和响应链路已经跑通。
+**判据档位**（只有 ③④ 需要选）决定漏斗用哪套标定参数：
+
+- **严格判据** —— 有安全风险的场景，例如需要念字的药盒、路上指示牌等。该判据严格拒绝质量不佳的图像防止模型输出幻觉。
+- **日常判据** —— 日常场景。
+
+只有进程指示灯全部变绿、并且第一视角持续更新，才能说明链路就绪。
+只看到面板 UI 打开，不能证明模型、声音、图像和响应链路已经跑通。
 
 ### 面板进程生命周期
 
@@ -258,8 +297,8 @@ OpenGlass/
 
 ## 已知限制
 
-- 当前公开仓库尚未完成全新机器上的 Omni 端到端验证。
-- 当前面板仍包含机器专属运行路径，没有真正使用 `runtime.local.json`。
+- 语音技能切换时的指令注入在当前 `/v1/realtime` 协议下不生效（协议没有对应字段），模型只能依赖 system prompt 完成任务。
+- 「基础对话」与 harness 链路各自带一套第一视角前端和录制模块，仓库中存在两份同名文件，互不影响但容易混淆。
 - Prompt 仍写在 `panel.py` 中，独立的 `prompts.json` 尚未接入。
 - ESP32 Wi-Fi 仍需修改 tracked `.ino`，本地 Wi-Fi 头文件模板尚未接入。
 - 正常关窗会执行清理，但异常退出可能留下子进程或外部启动的进程。

@@ -80,3 +80,10 @@ tmp/
 *.tmp.mov
 *.tmp.avi
 *.scratch.*
+
+runtime.local.json
+devices.json
+certs/
+
+# 漏斗的语音提示音是运行时必需资源，必须随仓库分发
+!extensions/assistive_harness/phase_b/assets/reject_wav/*.wav

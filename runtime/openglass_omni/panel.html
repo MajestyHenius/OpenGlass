@@ -107,6 +107,10 @@
     <select id="deviceSel" onchange="onDeviceChange()"
       style="background:#21262d;color:var(--txt);border:1px solid var(--border);
              border-radius:8px;padding:9px 12px;font-size:14px;margin-right:6px"></select>
+    <label id="sceneLabel" style="font-size:13px;color:var(--muted);margin-right:-8px">判据</label>
+    <select id="sceneSel" onchange="onSceneChange()"
+      style="background:#21262d;color:var(--txt);border:1px solid var(--border);
+             border-radius:8px;padding:9px 12px;font-size:14px;margin-right:6px"></select>
     <button class="btn-go" onclick="startAll()">▶ 一键启动</button>
     <button class="btn-restart" onclick="restartDemo()">⟳ 重启</button>
     <button class="btn-stop" onclick="stopDemo()">■ 停止</button>
@@ -184,10 +188,19 @@ async function init(){
   (CFG.devices||[]).forEach(d=>{
     const o=document.createElement("option"); o.value=d; o.textContent=d; sel.appendChild(o);
   });
-  applyChain();          // 按链路刷新灯/日志页签/FPV/眼镜下拉可见性
+  // 填充判据下拉（只有开了漏斗的链路用得上，applyChain 里控制显隐）
+  const ssel = document.getElementById("sceneSel");
+  (CFG.scenes||[]).forEach(x=>{
+    const o=document.createElement("option"); o.value=x; o.textContent=x; ssel.appendChild(o);
+  });
+  if(CFG.default_scene) ssel.value = CFG.default_scene;
+  applyChain();          // 按链路刷新灯/日志页签/FPV/眼镜+判据下拉可见性
   fpvOn=false; toggleFpv();   // 默认开启第一视角画面
   setInterval(poll, 1000);
 }
+
+// 进程内部名 -> 界面显示名（拿不到就退回内部名）
+function PLABEL(n){ return (CFG.proc_labels && CFG.proc_labels[n]) || n; }
 
 // 切链路：重画状态灯、日志页签、FPV 地址；Rokid 分支隐藏眼镜下拉
 function applyChain(){
@@ -197,7 +210,7 @@ function applyChain(){
   lights.innerHTML = "";
   c.procs.forEach(n=>{
     const d=document.createElement("div"); d.className="light";
-    d.innerHTML = `<span class="dot" id="dot-${n}"></span>${n}`;
+    d.innerHTML = `<span class="dot" id="dot-${n}"></span>${PLABEL(n)}`;
     lights.appendChild(d);
   });
   // 日志页签（保留 autoscroll 勾选框）
@@ -206,7 +219,7 @@ function applyChain(){
   tabs.innerHTML = "";
   c.procs.forEach((n,i)=>{
     const t=document.createElement("div");
-    t.className="tab"+(i===0?" active":""); t.dataset.t=n; t.textContent=n;
+    t.className="tab"+(i===0?" active":""); t.dataset.t=n; t.textContent=PLABEL(n);
     t.onclick=()=>switchTab(n); tabs.appendChild(t);
   });
   tabs.appendChild(auto);
@@ -215,6 +228,10 @@ function applyChain(){
   const show = c.need_device;
   document.getElementById("deviceSel").style.display = show ? "" : "none";
   document.getElementById("devLabel").style.display  = show ? "" : "none";
+  // 判据下拉：只有开了漏斗的链路(③④)才显示；①②没有漏斗，选了也不起作用
+  const showScene = !!c.need_scene;
+  document.getElementById("sceneSel").style.display   = showScene ? "" : "none";
+  document.getElementById("sceneLabel").style.display = showScene ? "" : "none";
   // FPV 地址随链路变（ESP32=demo bridge_ui:8080；Rokid=bridge:18080 自带页）
   document.getElementById("fpvUrl").textContent = c.fpv_url;
   if(fpvOn){ fpvOn=false; toggleFpv(); }   // 重挂 iframe 到新地址
@@ -226,6 +243,8 @@ function onChainChange(){
 }
 function curDevice(){ return document.getElementById("deviceSel").value; }
 function onDeviceChange(){ window.pywebview.api.set_device(curDevice()); }
+function curScene(){ const e=document.getElementById("sceneSel"); return e ? e.value : ""; }
+function onSceneChange(){ window.pywebview.api.set_scene(curScene()); }
 function selectPreset(name,el){
   document.querySelectorAll(".preset").forEach(p=>p.classList.remove("active"));
   el.classList.add("active");
@@ -234,7 +253,7 @@ function selectPreset(name,el){
 }
 function startAll(){
   const p = document.getElementById("prompt").value.trim();
-  window.pywebview.api.start_all(p, curDevice(), curChain);
+  window.pywebview.api.start_all(p, curDevice(), curChain, curScene());
 }
 function stopDemo(){ window.pywebview.api.stop_demo(); }   // 停止：只停 demo，无需确认（现场要快）
 function restartDemo(){

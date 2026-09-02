@@ -646,6 +646,19 @@ _PAN_HINT = {"top": "请向上看一点", "bottom": "请向下看一点",
 
 _ORI_CLS = None            # 方向分类器单例(全局只加载一次)
 _ORI_CLS_TRIED = False     # 是否已尝试加载(避免反复重试失败)
+_ORI_CLS_ERR = ""          # 加载失败原因(供上层如实报告，不要只看"预热就绪")
+
+
+def orient_classifier_status():
+    """返回 (是否可用, 失败原因)。
+
+    为什么需要它：`[预热] 方向分类器就绪` 那行是**无条件打印耗时**的，
+    加载失败时 process_orientation 会静默回退到轻量 CV 判据、照样返回，
+    预热照样报"就绪" —— 于是"预热成功"根本不能证明分类器可用。
+    实测 panel 环境下加载失败（paddle 循环导入），退到轻量判据后
+    第一轮就误判 orient_flipped，而手敲环境加载成功、判定正常。
+    """
+    return (_ORI_CLS is not None), _ORI_CLS_ERR
 
 def _get_orient_classifier():
     """懒加载 PaddleOCR 文档方向分类器(PP-LCNet, 6.75MB, 0/90/180/270)。
@@ -672,6 +685,8 @@ def _get_orient_classifier():
         except Exception as e:
             last_err = e
             continue                           # 这个参数组合不行, 换下一个
+    global _ORI_CLS_ERR
+    _ORI_CLS_ERR = f"{type(last_err).__name__}: {last_err}"
     print(f"[orient] 方向分类器加载失败, 回退到轻量CV判据: {last_err}")
     _ORI_CLS = None
     return None
