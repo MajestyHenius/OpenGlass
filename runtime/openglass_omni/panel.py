@@ -580,6 +580,10 @@ class ProcManager:
         self.current_prompt = next(iter(cfg["presets"].values()))
         self.current_device = (cfg.get("devices") or ["默认"])[0]
         self.current_scene = cfg.get("default_scene", "严格判据")
+        # 尾进程是"为哪套配置"起的。②③④ 共用 demo_funnel 这一个进程名，
+        # 只看进程活着就跳过启动的话，切链路后新的漏斗参数永远不会生效 ——
+        # UI 显示④，实际还在跑②。所以记指纹，变了就重启。
+        self._tail_started_for = {}      # tail 进程名 -> 指纹
         # —— 当前链路：esp32 / rokid，决定第四级起哪个进程 ——
         self.current_chain = cfg.get("default_chain", "esp32")
         self._lock = threading.Lock()
@@ -980,6 +984,7 @@ class ProcManager:
         return proc
 
     def _kill(self, name, graceful=False, grace_timeout=20):
+        self._forget_tail_fp(name)   # 进程要没了，指纹一并作废
         proc = self.procs.get(name)
         if not proc or proc.poll() is not None:
             self.status[name] = "stopped"
@@ -1183,6 +1188,9 @@ class ProcManager:
             self._spawn(name)
             if self._wait_ready_or_die(name, ready_timeout):
                 self.status[name] = "running"
+                if name == self.tail():
+                    # 记下这次是按哪套配置起的，下次切链路时用来判断要不要重启
+                    self._tail_started_for[name] = self._tail_fingerprint()
                 return True
             # 未就绪/退出/被急停：先把这次 spawn 的进程杀干净，绝不留残余
             p = self.procs.get(name)
@@ -1205,10 +1213,27 @@ class ProcManager:
                 return False
         return False
 
+    def _forget_tail_fp(self, name):
+        """进程不在了就清掉指纹，否则下次会误判成"配置没变、跳过启动"。"""
+        self._tail_started_for.pop(name, None)
+
     def _other_tails(self):
         """除当前链路外，其它链路的第四级进程名。"""
         cur = self.tail()
         return [c["tail"] for k, c in self.cfg["chains"].items() if c["tail"] != cur]
+
+    def _tail_fingerprint(self):
+        """当前链路下，尾进程真正依赖的那几个量。
+
+        任何一项变了，已在跑的尾进程就是按旧配置起的，必须重启：
+          chain   决定漏斗档位（--funnel / --no-reject / --force-measure）
+          scene   决定 --scene（严格/日常判据）
+          device  决定 --esp32-host / --esp32-port / --rotate
+          prompt  决定 --prompt
+        """
+        c = self.chain()
+        return (self.current_chain, c.get("funnel", 0), self.current_scene,
+                self.current_device, self.current_prompt)
 
     def _do_start_all(self):
         # ②③④ 的两个前置检查：extensions 复制了没、档位④的 wav 有没有。
@@ -1228,9 +1253,22 @@ class ProcManager:
             if self._cancel.is_set():
                 return
             if self._alive(name):
-                self.status[name] = "running"
-                self._log(name, "已在运行，跳过启动")
-                continue
+                # 尾进程还要比配置指纹：同一个 demo_funnel 进程，
+                # ②③④ 传的参数完全不同，光看"活着"会漏掉重启。
+                if name == self.tail():
+                    want = self._tail_fingerprint()
+                    got = self._tail_started_for.get(name)
+                    if got is not None and got != want:
+                        self._log(name, "配置已变（链路/判据/眼镜/Prompt），重启该进程")
+                        self._kill(name, graceful=True, grace_timeout=120)
+                    else:
+                        self.status[name] = "running"
+                        self._log(name, "已在运行，跳过启动")
+                        continue
+                else:
+                    self.status[name] = "running"
+                    self._log(name, "已在运行，跳过启动")
+                    continue
             if not self._start_one(name):
                 if self._cancel.is_set():
                     self._log(name, "!! 启动被急停中止")

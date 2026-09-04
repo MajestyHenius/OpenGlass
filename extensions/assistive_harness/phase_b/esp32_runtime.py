@@ -1049,6 +1049,15 @@ async def esp32_image_loop(
                     if wav_pcm is None:
                         LOG.warning("[强制措施] 无 %s.wav，跳过播报", reason)
                         return
+                    # 记下发 stop 时的 stop_count，作为"这次暂停归我"的凭据。
+                    #   漏斗的 stop 意思是"先别说，我要插播提示"，
+                    #   用户的 stop 意思是"闭嘴，我不想听" —— 两者走同一条 8021
+                    #   控制腿，无从区分。播报期间用户若说"停一下"，
+                    #   gate.stop() 会让 stop_count 再 +1；此时若还无条件 resume，
+                    #   就把用户的停止状态覆盖掉了。
+                    #   （播报改成后台任务之后，这个并发窗口更大了。）
+                    _gate = getattr(manager, "gate", None)
+                    _owned = getattr(_gate, "stop_count", None) if _gate else None
                     try:
                         await harness.send({"type": "funnel.stop", "reason": reason})
                         LOG.info("[强制措施] funnel.stop 已发 (%s)", reason)
@@ -1065,6 +1074,14 @@ async def esp32_image_loop(
                         await asyncio.sleep(dur + 0.2)
                     except Exception as e:
                         LOG.warning("[强制措施] 播 wav 失败: %s", e)
+                    # 只有"这次暂停仍归我"才 resume。stop_count 变了说明期间
+                    # 有新的 stop 进来（用户按的），此时保持停止状态不动。
+                    _now_cnt = getattr(_gate, "stop_count", None) if _gate else None
+                    if _owned is not None and _now_cnt is not None and _now_cnt != _owned:
+                        LOG.info("[强制措施] 播报期间收到新的 STOP"
+                                 "（stop_count %s→%s），保留用户的停止状态，不 resume",
+                                 _owned, _now_cnt)
+                        return
                     try:
                         await harness.send({"type": "funnel.resume", "reason": "hint_done"})
                         LOG.info("[强制措施] funnel.resume 已发（提示播完）")
@@ -1346,7 +1363,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                  gateway_host="127.0.0.1", gateway_port=8040,
                  reject_wav_dir="assets/reject_wav",
                  live_record_dir=None, rerun_from=None,
-                 funnel_rerun_from=None, web_ui_port=None,
+                 funnel_rerun_from=None, web_ui_port=None, web_ui_host="127.0.0.1",
                  record_no_media: bool = False,
                  rerun_tail_wait_s: float = 30.0,
                  no_reject: bool = False,
@@ -1395,8 +1412,12 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             try:
                 self._web_ui = WebUIServer(
                     port=web_ui_port,
+                    host=web_ui_host,
                     sessions_root=Path(live_record_dir).parent if live_record_dir
                     else Path("live_sessions"),
+                    # 接上运行时的停止事件：不接的话 POST /api/stop 会返回成功、
+                    # 前端按钮也变灰，但运行时根本没停，session 也不会收尾落盘。
+                    stop_callback=self._stop_evt.set,
                     mode_info={"mode": "rerun" if (rerun_from or funnel_rerun_from)
                                else "live"},
                 )
@@ -1531,6 +1552,26 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         #   oneDNN 编译（~2s，甚至 5s+）。不预热的话它会推迟到第一次 accept 才现场加载，
         #   卡住那一轮，且在此之前链路出不了 send（模型长时间拿不到图）。
         if self._funnel is not None:
+            # ★ 先在**主线程**里把 paddle/paddleocr 导进来。
+            #   cam_pipeline_v2 的 `from paddleocr import ...` 是懒加载、写在函数体里，
+            #   而 warmup_orient 走 asyncio.to_thread（工作线程）—— paddle 这类
+            #   带大量 C 扩展和内部循环依赖的包，在非主线程首次导入时会撞上
+            #   "partially initialized module 'paddle' has no attribute 'tensor'
+            #    (most likely due to a circular import)"，
+            #   然后 _ORI_CLS_TRIED 永久置位、整个进程退回错误的早期 CV 判据，
+            #   表现就是第一轮就误报 orient_flipped（实测 panel 启动必现）。
+            #   在主线程预导一次，后面线程里再 import 就是拿缓存，不会再触发。
+            try:
+                # ★ 只导这一个符号，**不要 `import paddleocr` 或 `import paddle`**。
+                #   `import paddleocr` 会走 paddlex.inference.utils.official_models
+                #   → import modelscope → modelscope.utils.logger → import torch，
+                #   而这个环境里 torch 的 shm.dll 加载失败（WinError 127），
+                #   于是整条链断掉、方向分类器退回错误的早期 CV 判据。
+                #   窄导入不经过那一支，实测可用（cam_pipeline_v2 里也是这么写的）。
+                from paddleocr import DocImgOrientationClassification  # noqa: F401
+                LOG.info("[预热] paddleocr 方向分类器已在主线程预导入")
+            except Exception as e:
+                LOG.warning("[预热] 方向分类器预导入失败（可能退回轻量判据）: %s", e)
             try:
                 ms = await asyncio.to_thread(self._funnel.warmup_orient)
                 # 必须查真实状态：这行原来无条件打"就绪"，而加载失败时
@@ -1770,6 +1811,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--web-ui-port", type=int, default=None,
                    help="开 bridge_ui 第一视角(如 8080)，live/rerun/funnel-rerun 都可看")
     # ── 强制措施（防幻觉）：reject 时用模型音色念提示 + 停/恢复走 8021 ──
+    p.add_argument("--web-ui-host", default="127.0.0.1",
+                   help="第一视角服务的绑定地址。默认只绑回环 —— 该服务无认证地提供"
+                        "画面、session 元数据和原始 user/AI 录音；"
+                        "要给局域网内别的设备看才填 0.0.0.0，风险自负")
     p.add_argument("--force-measure", action="store_true",
                    help="开启强制措施：reject→停duplex→播预生成wav→恢复duplex")
     p.add_argument("--reject-wav-dir", default="assets/reject_wav",
@@ -1874,6 +1919,7 @@ def main() -> None:
         rerun_from=args.rerun_from,
         funnel_rerun_from=args.funnel_rerun_from,
         web_ui_port=args.web_ui_port,
+        web_ui_host=args.web_ui_host,
         record_no_media=args.record_no_media,
         rerun_tail_wait_s=args.rerun_tail_wait_s,
         no_reject=args.no_reject,

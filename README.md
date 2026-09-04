@@ -92,7 +92,7 @@ Solid arrows represent code or artifacts present in the public repository. Dashe
 
 The control panel is intended to make **repeated runs** one-click after a one-time setup. It does not download model weights, clone upstream repositories, compile `llama.cpp-omni`, or flash the ESP32 for you.
 
-> **Current clean-clone status:** The panel itself starts directly from the repository root, but the full chain still needs four out-of-repo assets prepared by hand: the `llama.cpp-omni` build, MiniCPM-o GGUF weights, the FunASR model, and the Wi-Fi credentials inside the ESP32 firmware. None of these live in this repository, and none can be fetched automatically.
+> **Current clean-clone status:** The panel UI starts from the repository root, but the current launcher still reads machine-specific paths from `runtime/openglass_omni/panel.py`. The included `runtime.local.json` loader is not yet connected to that panel. Follow the effective configuration locations below; a code update is still required before this can be called a portable one-click installation.
 
 ### 1. Prerequisites
 
@@ -120,7 +120,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release --target llama-omni-server -j
 cd ..
 
-git clone --branch master https://github.com/OpenBMB/MiniCPM-o-Demo.git
+git clone --branch main https://github.com/OpenBMB/MiniCPM-o-Demo.git
 cd MiniCPM-o-Demo
 python -m pip install -r requirements.txt
 cd ..
@@ -129,7 +129,7 @@ git clone https://github.com/OpenSQZ/OpenGlass.git
 cd OpenGlass
 python -m pip install -r runtime/openglass_omni/requirements.txt
 
-python -m pip install -r extensions/requirements-phase-b.txt   # voice control + CV funnel (harness chains only; skip if you just run basic chat)
+python -m pip install -r extensions/assistive_harness/phase_b/requirements-phase-b.txt   # voice control + CV funnel (harness chains only; skip if you just run basic chat)
 
 ```
 
@@ -180,32 +180,17 @@ Edit `runtime/openglass_omni/devices.json`:
 
 ### 5. Configure the current launcher
 
-Copy [`runtime.example.json`](runtime/openglass_omni/runtime.example.json) to
-`runtime.local.json` in the same directory and fill in your machine paths. The panel reads
-it at startup and uses those values instead of the defaults in `panel.py`:
+At present, these are the **effective** settings:
 
-```json
-{
-  "conda_env": null,
-  "minicpm_demo_root": "D:\\path\\to\\MiniCPM-o-Demo",
-  "llama_server": "D:\\path\\to\\llama.cpp-omni\\build\\bin\\Release\\llama-omni-server.exe",
-  "llama_model": "D:\\path\\to\\MiniCPM-o-gguf\\MiniCPM-o-4_5-Q4_K_M.gguf",
-  "asr_model": "D:\\path\\to\\LocalASRmodel\\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
-  "glasses": { "ssid": "YOUR_WIFI", "psk": "YOUR_WIFI_PASSWORD" }
-}
-```
-
-| What to configure | Location | Value |
+| What to configure | Effective location now | Value |
 | --- | --- | --- |
-| MiniCPM-o-Demo checkout | `minicpm_demo_root` | Absolute path containing upstream `worker.py` / `gateway.py` |
-| `llama-omni-server` binary | `llama_server` | Compiled executable under `llama.cpp-omni/build` |
-| Main GGUF model | `llama_model` | Absolute path to the main MiniCPM-o 4.5 GGUF |
-| ASR model | `asr_model` | FunASR streaming model directory, used by voice control in chains 2-4 |
-| Glasses Wi-Fi | `glasses.ssid` / `glasses.psk` | Passed to the Rokid APK at launch; leave empty and only that chain loses glasses connectivity |
+| MiniCPM-o-Demo checkout | [`panel.py` `CONFIG["minicpm_demo_dir"]`](runtime/openglass_omni/panel.py) | Absolute path containing upstream `worker.py` and `gateway.py` |
+| `llama-omni-server` binary | [`panel.py` `CONFIG["procs"]["llama"]`](runtime/openglass_omni/panel.py) | Compiled executable under `llama.cpp-omni/build` |
+| Main GGUF model | Same `llama` command after `-m` | Absolute path to the main MiniCPM-o 4.5 GGUF |
 | Glasses name/IP/rotation | `runtime/openglass_omni/devices.json` | One entry per ESP32 glasses prototype |
-| Prompt presets | [`panel.py` `CONFIG["presets"]`](runtime/openglass_omni/panel.py) | Interaction prompts shown by the panel |
+| Prompt presets | [`panel.py` `CONFIG["presets"]`](runtime/openglass_omni/panel.py) | Interaction prompts shown by the current panel |
 
-The panel self-signs a TLS certificate and key pair under `<minicpm_demo_root>/certs/` on first launch, used by the `wss` connections to the gateway (8006) and the voice-control harness (8021). An existing pair is left untouched.
+[`runtime.example.json`](runtime/openglass_omni/runtime.example.json) and [`prompts.json`](runtime/openglass_omni/prompts.json) document the intended local configuration boundary, but the current panel does not consume either file. Copying the runtime example to `runtime.local.json` does **not yet replace** the hardcoded panel paths or prompt presets. This is a known integration issue, not a user configuration mistake.
 
 ### 6. Configure and flash Wi-Fi firmware
 
@@ -221,39 +206,16 @@ Activate the same Python environment used for MiniCPM-o-Demo, then run from the 
 python glasses_panel.py
 ```
 
-Pick a **chain**, a **device** (and a **criteria** preset for chains 3-4) at the top,
-then click **Start**.
-
-Five chains are available. The four ESP32 ones are cumulative — each adds exactly one
-thing to the previous:
-
-| Chain | Function | Processes started |
-| --- | --- | --- |
-| 1 Basic chat | Full-duplex omni-modal conversation with the local model through the glasses | llama -> worker -> gateway -> esp32_bridge |
-| 2 Voice control | Understands "stop", "start over", "find X" | llama -> worker -> gateway -> harness -> esp32_bridge |
-| 3 Frame selection | Picks the sharpest of several frames per second | same as 2 |
-| 4 Full anti-hallucination | Rejects bad frames with a spoken hint, so the model never sees them | same as 2 |
-| Rokid | Reverse link: the PC listens on 18080 for the APK | llama -> worker -> gateway -> rokid |
-
-Chains 1-4 are **mutually exclusive**: each needs exclusive access to the glasses' audio
-channel and image port, so only one can run at a time.
+Select **ESP32 Glasses**, choose the device name, and click **Start**. The current panel attempts to start:
 
 ```text
 llama-omni-server :22500
         -> worker :22400
         -> gateway :8006
-        -> harness :8021        (chains 2-4 only)
-        -> glasses client / first-person view :8080
+        -> ESP32 bridge / local view :8080
 ```
 
-The **criteria** selector (chains 3-4 only) picks which calibration the funnel uses:
-
-- **Strict** — safety-relevant scenes, such as reading a medicine box or a street sign. This preset rejects low-quality frames aggressively to keep the model from hallucinating.
-- **Everyday** — ordinary day-to-day scenes.
-
-The chain is ready only when all process indicators are green and the first-person view is
-updating. A successful UI launch alone does not prove the model, audio, image, and
-response path is complete.
+The chain is ready only when all four process indicators are green and the first-person view is updating. A successful UI launch alone does not prove the model, audio, image, and response path is complete.
 
 ### Panel lifecycle
 
@@ -299,8 +261,8 @@ Upstream model projects and model weights remain external dependencies and are n
 
 ## Known Limitations
 
-- Task injection on skill switch has no effect over the current `/v1/realtime` protocol (there is no equivalent field); the model relies on the system prompt instead.
-- Basic chat and the harness chains each carry their own first-person-view frontend and recorder, so the tree contains two same-named copies. They do not interfere, but the duplication is easy to misread.
+- A clean-machine end-to-end Omni run has not yet been verified from the current public tree.
+- The current panel still contains machine-specific runtime paths instead of consuming `runtime.local.json`.
 - Prompt presets are still embedded in `panel.py`; the standalone `prompts.json` file is not yet connected.
 - ESP32 Wi-Fi credentials still require editing the tracked `.ino`; the local header template is not wired in yet.
 - Normal panel close performs cleanup, but abnormal termination can leave child or externally started processes running.

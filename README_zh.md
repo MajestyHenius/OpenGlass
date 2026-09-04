@@ -92,7 +92,7 @@ flowchart LR
 
 控制面板的目标是：完成一次性环境准备后，后续实验可以一键重复启动。它不会替用户下载模型权重、clone 上游仓库、编译 `llama.cpp-omni` 或烧录 ESP32。
 
-> **当前全新 clone 状态：** 面板本身可以从仓库根目录直接启动,但整套链路仍需手动准备四样仓库外的资源:`llama.cpp-omni` 编译结果、MiniCPM-o GGUF 权重、FunASR 模型、以及 ESP32 固件里的 Wi-Fi 凭据。这几项都不在本仓库内,需按以下说明安装。
+> **当前全新 clone 状态：** 从仓库根目录启动面板 UI，本机路径写在 `runtime.local.json`（复制 `runtime.example.json` 得到），面板启动时读取。眼镜列表和旋转角在 `devices.json`。TLS 证书首次启动自动生成。仍需手动准备的是仓库外的资源：`llama.cpp-omni` 编译结果、MiniCPM-o GGUF 权重、FunASR 模型，以及 ESP32 固件里的 Wi-Fi 凭据。
 
 ### 1. 前置条件
 
@@ -120,7 +120,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build build --config Release --target llama-omni-server -j
 cd ..
 
-git clone --branch master https://github.com/OpenBMB/MiniCPM-o-Demo.git
+git clone --branch main https://github.com/OpenBMB/MiniCPM-o-Demo.git
 cd MiniCPM-o-Demo
 python -m pip install -r requirements.txt
 cd ..
@@ -129,7 +129,7 @@ git clone https://github.com/OpenSQZ/OpenGlass.git
 cd OpenGlass
 python -m pip install -r runtime/openglass_omni/requirements.txt
 
-python -m pip install -r extensions/requirements-phase-b.txt   # 语音控制 + CV 漏斗（harness链路需要，只跑基础对话无需安装）
+python -m pip install -r extensions/assistive_harness/phase_b/requirements-phase-b.txt   # 语音控制 + CV 漏斗（harness链路需要，只跑基础对话无需安装）
 
 ```
 
@@ -207,7 +207,8 @@ Copy-Item examples/configs/devices.example.json runtime/openglass_omni/devices.j
 | 眼镜名称/IP/旋转角 | `runtime/openglass_omni/devices.json` | 每副 ESP32 眼镜一条记录 |
 | Prompt 预设 | [`panel.py` 的 `CONFIG["presets"]`](runtime/openglass_omni/panel.py) | 面板中显示的交互 Prompt |
 
-> 面板首次启动时会在 `<minicpm_demo_root>/certs/` 下自签一对 TLS 证书,供 gateway(8006)和语音控制 harness(8021)的 `wss` 连接使用。
+**TLS 证书不用手动准备。** 面板首次启动时会在 `<minicpm_demo_root>/certs/` 下自签一对
+（gateway 8006 和 harness 8021 共用），已存在则不覆盖。
 
 ### 6. 配置并烧录 Wi-Fi 固件
 

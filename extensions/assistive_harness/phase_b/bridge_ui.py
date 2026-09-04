@@ -52,7 +52,10 @@ def _load_template(name: str) -> str:
 # ============================================================
 
 class WebUIServer:
-    def __init__(self, port: int = 8080, host: str = "0.0.0.0",
+    # 默认只绑回环：这个服务把第一视角画面、session 元数据、原始 user/AI wav
+    # 全部无认证地暴露出去。绑 0.0.0.0 等于把它们放给整个局域网，
+    # 要那样必须由调用方显式指定 host。
+    def __init__(self, port: int = 8080, host: str = "127.0.0.1",
                  sessions_root: Path = Path("./sessions"),
                  stop_callback: Optional[Callable[[], None]] = None,
                  mode_info: Optional[dict] = None):
@@ -85,9 +88,28 @@ class WebUIServer:
         app.router.add_post('/api/stop', self._h_stop)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
-        LOGGER.info("[UI] http://%s:%d  (live + replay)", self.host, self.port)
+        # 回环默认同时绑 IPv4 和 IPv6。
+        #   只绑 "127.0.0.1" 的话是**纯 IPv4**，而 Windows 上浏览器把
+        #   `localhost` 优先解析成 ::1 的情况很常见 —— 那时 panel 内嵌的
+        #   http://localhost:8080 会连不上（表现就是第一视角一片空白）。
+        #   绑成 ["127.0.0.1", "::1"] 两边都覆盖，又不暴露到局域网。
+        _hosts = self.host
+        if self.host in ("127.0.0.1", "localhost", "::1"):
+            _hosts = ["127.0.0.1", "::1"]
+        try:
+            site = web.TCPSite(self._runner, _hosts, self.port)
+            await site.start()
+        except OSError as e:
+            # 系统没开 IPv6 之类：退回单地址，别让整个第一视角起不来
+            LOGGER.warning("[UI] 绑定 %s 失败(%s)，退回 %s", _hosts, e, self.host)
+            site = web.TCPSite(self._runner, self.host, self.port)
+            await site.start()
+        LOGGER.info("[UI] http://localhost:%d  (live + replay)  bind=%s",
+                    self.port, _hosts)
+        if self.host not in ("127.0.0.1", "localhost", "::1"):
+            LOGGER.warning(
+                "[UI] !! 绑定在 %s —— 第一视角画面、session 元数据、"
+                "原始 user/AI 录音将无认证地暴露给局域网内任何人。", self.host)
 
     async def stop(self) -> None:
         for ws in list(self.live_clients):
@@ -293,7 +315,10 @@ def _main() -> None:
         description="Bridge UI — standalone replay server (no ESP32 / no model)"
     )
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="绑定地址。默认只绑回环 —— 本服务无认证地提供"
+                             "第一视角画面、session 元数据和原始 user/AI wav，"
+                             "填 0.0.0.0 会把这些暴露给整个局域网")
     parser.add_argument("--sessions", default="./sessions",
                         help="sessions 根目录(默认 ./sessions)")
     args = parser.parse_args()
