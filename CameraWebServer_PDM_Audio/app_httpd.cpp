@@ -1,4 +1,4 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+﻿// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,11 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// 新增：用于对 WS socket 做 TCP 层调优（TCP_NODELAY / SO_SNDBUF / keepalive）
+#include "lwip/sockets.h"
+#include "lwip/tcp.h"
+// 前向声明：定义在后面，但 ws_audio_handler / ws_audio_v2_handler 会先调用它
+static void ws_tune_socket(int fd);
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -70,13 +75,46 @@ bool isStreaming = false;
 #define AUDIO_DISCARD_FRAMES 5    // Discard first N frames after connect (flush stale DMA data)
 
 // ============================================================
+// v5 buffered: timestamped ring buffer (PSRAM-backed)
+// Producer (PDM capture) writes packets; consumer (WS sender) drains them.
+// Decouples audio capture from WiFi send blocking (camera uploads).
+// ============================================================
+#define AUDIO_PKT_SAMPLES      320                 // 20ms @ 16kHz
+#define AUDIO_PKT_BYTES        (AUDIO_PKT_SAMPLES * 2)  // 640 bytes PCM
+#define AUDIO_RING_CAPACITY    400                 // 160 * 20ms = 3.2 s buffer  160改成了400抗抖动，代价是PSRAM 多吃约 160 KB，8MB PSRAM 毫无压力。
+#define AUDIO_WIRE_HDR_BYTES   12                  // seq(4) + ts_ms(4) + n_samples(2) + drops(2)
+#define AUDIO_WIRE_PKT_BYTES   (AUDIO_WIRE_HDR_BYTES + AUDIO_PKT_BYTES)
+
+#pragma pack(push, 1)
+typedef struct {
+  uint32_t seq;                        // monotonic packet sequence number
+  uint32_t ts_ms;                      // ESP32 timestamp (esp_timer ms) of first sample
+  uint16_t n_samples;                  // number of PCM16 samples in this packet
+  uint16_t reserved;                   // pad / future use
+  int16_t  pcm[AUDIO_PKT_SAMPLES];     // PCM16 little-endian data
+} audio_pkt_t;
+#pragma pack(pop)
+
+// ============================================================
 // Audio state (cross-task, volatile)
 // ============================================================
 // g_audio_mode removed — Phase A concurrent mode, camera + PDM run simultaneously
 static volatile bool g_audio_streaming = false;   // Whether audio streaming task is running
 static i2s_chan_handle_t g_pdm_rx_handle = NULL;  // I2S PDM RX channel handle
 static volatile int g_ws_audio_fd = -1;           // WS client socket fd
-static volatile TaskHandle_t g_audio_task = NULL; // Audio streaming task handle
+static volatile TaskHandle_t g_audio_task = NULL; // v1 single-task (legacy) handle
+
+// v5: split producer/consumer task handles
+static volatile TaskHandle_t g_audio_capture_task_h = NULL;
+static volatile TaskHandle_t g_audio_sender_task_h  = NULL;
+
+// v5: ring buffer
+static audio_pkt_t *g_audio_ring = NULL;
+static volatile uint32_t g_ring_head  = 0;  // producer writes here (next write slot)
+static volatile uint32_t g_ring_tail  = 0;  // consumer reads here (next read slot)
+static volatile uint32_t g_ring_seq   = 0;  // monotonic seq counter
+static volatile uint32_t g_ring_drops = 0;  // total dropped-oldest count since init
+static portMUX_TYPE g_ring_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // External: camera init/deinit (defined in .ino)
 extern bool init_camera();
@@ -328,6 +366,252 @@ static void audio_stream_task(void *param) {
   free(buf);
   g_audio_streaming = false;
   g_audio_task = NULL;
+  vTaskDelete(NULL);
+}
+
+// ============================================================
+// v5 BUFFERED: Ring buffer helpers
+// ============================================================
+
+static bool audio_ring_init() {
+  if (g_audio_ring) {
+    // already allocated — just reset pointers
+    taskENTER_CRITICAL(&g_ring_mux);
+    g_ring_head = g_ring_tail = g_ring_seq = g_ring_drops = 0;
+    taskEXIT_CRITICAL(&g_ring_mux);
+    return true;
+  }
+  size_t total = (size_t)AUDIO_RING_CAPACITY * sizeof(audio_pkt_t);
+  g_audio_ring = (audio_pkt_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!g_audio_ring) {
+    Serial.printf("[RING] OOM: cannot alloc %u bytes in PSRAM (free PSRAM=%u)\n",
+                  (unsigned)total,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return false;
+  }
+  memset(g_audio_ring, 0, total);
+  g_ring_head = g_ring_tail = g_ring_seq = g_ring_drops = 0;
+  Serial.printf("[RING] Alloc %u bytes PSRAM for %d packets (%.1fs buffer)\n",
+                (unsigned)total, AUDIO_RING_CAPACITY,
+                AUDIO_RING_CAPACITY * 20.0f / 1000.0f);
+  return true;
+}
+
+static void audio_ring_deinit() {
+  if (g_audio_ring) {
+    heap_caps_free(g_audio_ring);
+    g_audio_ring = NULL;
+  }
+  g_ring_head = g_ring_tail = g_ring_seq = g_ring_drops = 0;
+}
+
+// ============================================================
+// v5 BUFFERED: Audio capture task (PRODUCER)
+// - Reads 20ms chunks from PDM
+// - Applies DC-offset removal + software gain (same as legacy path)
+// - Tags each packet with seq + ts_ms and writes to ring buffer
+// - Drops OLDEST packet if ring full (consumer fell behind due to WiFi stall)
+// ============================================================
+static void audio_capture_task(void *param) {
+  uint8_t *tmp = (uint8_t *)malloc(AUDIO_PKT_BYTES);
+  if (!tmp) {
+    Serial.printf("[CAP] OOM! Cannot allocate %d bytes\n", AUDIO_PKT_BYTES);
+    g_audio_capture_task_h = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  Serial.println("[CAP] Capture task started (ring-buffered)");
+  int32_t  dc_acc      = 0;
+  uint32_t frame_count = 0;
+  uint32_t last_log_ms = millis();
+
+  while (g_audio_streaming && g_pdm_rx_handle != NULL) {
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(g_pdm_rx_handle, tmp, AUDIO_PKT_BYTES,
+                                      &bytes_read, 200);
+    if (err != ESP_OK) {
+      if (err == ESP_ERR_TIMEOUT) continue;
+      Serial.printf("[CAP] i2s_channel_read error: 0x%x\n", err);
+      break;
+    }
+    if (bytes_read != AUDIO_PKT_BYTES) continue;  // partial reads skipped
+
+    frame_count++;
+    if (frame_count <= AUDIO_DISCARD_FRAMES) continue;
+
+    // DC offset removal (EMA) + software gain + clipping
+    {
+      int16_t *samples = (int16_t *)tmp;
+      int n = bytes_read / 2;
+      for (int i = 0; i < n; i++) {
+        dc_acc = dc_acc - (dc_acc >> 8) + (int32_t)samples[i];
+        int32_t val = (int32_t)samples[i] - (dc_acc >> 8);
+        val *= AUDIO_GAIN;
+        if (val >  32767) val =  32767;
+        if (val < -32768) val = -32768;
+        samples[i] = (int16_t)val;
+      }
+    }
+
+    uint32_t ts_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&g_ring_mux);
+    uint32_t head      = g_ring_head;
+    uint32_t next_head = (head + 1) % AUDIO_RING_CAPACITY;
+    if (next_head == g_ring_tail) {
+      // Ring full — drop oldest (advance tail)
+      g_ring_tail = (g_ring_tail + 1) % AUDIO_RING_CAPACITY;
+      g_ring_drops++;
+    }
+    audio_pkt_t *slot = &g_audio_ring[head];
+    slot->seq       = ++g_ring_seq;
+    slot->ts_ms     = ts_ms;
+    slot->n_samples = AUDIO_PKT_SAMPLES;
+    slot->reserved  = 0;
+    memcpy(slot->pcm, tmp, AUDIO_PKT_BYTES);
+    g_ring_head = next_head;
+    taskEXIT_CRITICAL(&g_ring_mux);
+
+    uint32_t now_ms = millis();
+    if (now_ms - last_log_ms >= 10000) {
+      uint32_t h, t, drops, seq;
+      taskENTER_CRITICAL(&g_ring_mux);
+      h = g_ring_head; t = g_ring_tail; drops = g_ring_drops; seq = g_ring_seq;
+      taskEXIT_CRITICAL(&g_ring_mux);
+      uint32_t pending = (h + AUDIO_RING_CAPACITY - t) % AUDIO_RING_CAPACITY;
+      Serial.printf("[CAP] seq=%u ring=%u/%d drops=%u heap=%u\n",
+                    seq, pending, AUDIO_RING_CAPACITY, drops,
+                    (unsigned)ESP.getFreeHeap());
+      last_log_ms = now_ms;
+    }
+  }
+
+  free(tmp);
+  Serial.println("[CAP] Capture task exit");
+  g_audio_capture_task_h = NULL;
+  vTaskDelete(NULL);
+}
+
+// ============================================================
+// v5 BUFFERED: Audio sender task (CONSUMER)
+// - Peeks one packet from ring tail
+// - Sends [header(12) | PCM16 data(640)] as a single WS BINARY frame
+// - On send success: advances tail
+// - On send error (typically WiFi congested while camera HTTP is uploading):
+//     retries same packet after a brief delay; does NOT advance tail.
+//     This is the core mechanism that gives "timestamp retransmit" semantics.
+// - After persistent failure (~ N retries = WS dead), stops streaming.
+// ============================================================
+static void audio_sender_task(void *param) {
+  Serial.println("[SND] Sender task started (Core 0)");
+  uint32_t total_bytes   = 0;
+  uint32_t total_packets = 0;
+  uint32_t send_errors   = 0;
+  uint32_t start_ms      = millis();
+  uint32_t last_log_ms   = start_ms;
+
+  // Wire buffer is allocated once (stack too small for ~652 bytes); in DRAM to avoid PSRAM latency for TCP
+  uint8_t *wire = (uint8_t *)malloc(AUDIO_WIRE_PKT_BYTES);
+  if (!wire) {
+    Serial.printf("[SND] OOM wire buf %d\n", AUDIO_WIRE_PKT_BYTES);
+    g_audio_sender_task_h = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  while (g_audio_streaming && g_ws_audio_fd >= 0) {
+    // Peek from ring tail (copy to avoid race with producer drop-oldest)
+    audio_pkt_t pkt;
+    uint32_t read_pos = 0;
+    bool     have_pkt = false;
+
+    taskENTER_CRITICAL(&g_ring_mux);
+    if (g_ring_tail != g_ring_head) {
+      read_pos = g_ring_tail;
+      pkt      = g_audio_ring[read_pos];
+      have_pkt = true;
+    }
+    taskEXIT_CRITICAL(&g_ring_mux);
+
+    if (!have_pkt) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    // Build wire packet: [seq(4) | ts_ms(4) | n_samples(2) | drops(2) | pcm(640)]
+    uint32_t seq_le    = pkt.seq;
+    uint32_t ts_le     = pkt.ts_ms;
+    uint16_t n_le      = pkt.n_samples;
+    uint32_t drops_cur;
+    taskENTER_CRITICAL(&g_ring_mux);
+    drops_cur = g_ring_drops;
+    taskEXIT_CRITICAL(&g_ring_mux);
+    uint16_t drops_le  = (drops_cur > 0xFFFFu) ? 0xFFFFu : (uint16_t)drops_cur;
+
+    memcpy(wire + 0,  &seq_le,   4);
+    memcpy(wire + 4,  &ts_le,    4);
+    memcpy(wire + 8,  &n_le,     2);
+    memcpy(wire + 10, &drops_le, 2);
+    memcpy(wire + 12, pkt.pcm,   AUDIO_PKT_BYTES);
+
+    httpd_ws_frame_t ws_frame;
+    memset(&ws_frame, 0, sizeof(ws_frame));
+    ws_frame.type    = HTTPD_WS_TYPE_BINARY;
+    ws_frame.payload = wire;
+    ws_frame.len     = AUDIO_WIRE_PKT_BYTES;
+    ws_frame.final   = true;
+
+    esp_err_t err = httpd_ws_send_frame_async(camera_httpd, g_ws_audio_fd, &ws_frame);
+    if (err != ESP_OK) {
+      // Keep the packet in the ring; retry later. Camera HTTP upload typically
+      // blocks 100-500ms; we back off and try again — this is the whole point.
+      send_errors++;
+      if (send_errors >= 125) {  // ~1 sec of continuous failures → give up  20260509，50改为125，2.5s
+        Serial.printf("[SND] WS send failed %u times (last 0x%x), closing\n",
+                      send_errors, err);
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    // Success: advance tail. Guard against producer having already advanced it
+    // past read_pos (ring-full drop case). Only advance if tail is still where
+    // we read from.
+    taskENTER_CRITICAL(&g_ring_mux);
+    if (g_ring_tail == read_pos) {
+      g_ring_tail = (read_pos + 1) % AUDIO_RING_CAPACITY;
+    }
+    taskEXIT_CRITICAL(&g_ring_mux);
+
+    send_errors    = 0;
+    total_bytes   += AUDIO_WIRE_PKT_BYTES;
+    total_packets++;
+
+    uint32_t now_ms = millis();
+    if (now_ms - last_log_ms >= 5000) {
+      float elapsed_s = (now_ms - start_ms) / 1000.0f;
+      uint32_t h, t, drops;
+      taskENTER_CRITICAL(&g_ring_mux);
+      h = g_ring_head; t = g_ring_tail; drops = g_ring_drops;
+      taskEXIT_CRITICAL(&g_ring_mux);
+      uint32_t pending = (h + AUDIO_RING_CAPACITY - t) % AUDIO_RING_CAPACITY;
+      Serial.printf("[SND] sent=%u pkts, %.1f KB/s, ring_pending=%u/%d drops=%u\n",
+                    total_packets,
+                    elapsed_s > 0 ? (total_bytes / 1024.0f / elapsed_s) : 0,
+                    pending, AUDIO_RING_CAPACITY, drops);
+      last_log_ms = now_ms;
+    }
+  }
+
+  free(wire);
+  Serial.printf("[SND] Sender task exit: sent=%u pkts\n", total_packets);
+
+  // Signal shutdown to capture task
+  g_audio_streaming = false;
+  g_ws_audio_fd     = -1;
+  g_audio_sender_task_h = NULL;
   vTaskDelete(NULL);
 }
 
@@ -628,6 +912,13 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   } else if (!strcmp(variable, "ae_level")) {
     res = s->set_ae_level(s, val);
   }
+  else if (!strcmp(variable, "af")) {
+      // 单次自动对焦: 写 0x3022=0x03, 和原 loop 触发动作一致。
+      // AF 走 SCCB, 与抓图共用总线, PC 端已限流 >1s, 勿高频调。
+      res = s->set_reg(s, 0x3022, 0xff, 0x03);
+
+}
+ 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
   else if (!strcmp(variable, "led_intensity")) {
     led_duty = val;
@@ -962,6 +1253,8 @@ static esp_err_t ws_audio_handler(httpd_req_t *req) {
     g_ws_audio_fd = httpd_req_to_sockfd(req);
     Serial.printf("[WS_AUDIO] Client connected, fd=%d\n", g_ws_audio_fd);
 
+    ws_tune_socket(g_ws_audio_fd);   // ← 新增
+
     // Start audio streaming task (Core 1, priority 5)
     g_audio_streaming = true;
     BaseType_t ok = xTaskCreatePinnedToCore(
@@ -1021,11 +1314,138 @@ static esp_err_t ws_audio_handler(httpd_req_t *req) {
 }
 
 // ============================================================
+// WebSocket handler for /ws_audio_v2 (v5 BUFFERED)
+// Wire format per BINARY frame:
+//   [seq:u32 LE][ts_ms:u32 LE][n_samples:u16 LE][drops:u16 LE][PCM16 x n_samples]
+// Packet cadence: 1 frame per 20ms (50 Hz)
+// ============================================================
+static esp_err_t ws_audio_v2_handler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) {
+    if (g_ws_audio_fd >= 0 || g_audio_streaming) {
+      Serial.println("[WS_AUDIO_V2] Rejected: another audio client already connected");
+      httpd_resp_set_status(req, "409 Conflict");
+      httpd_resp_set_type(req, "text/plain");
+      return httpd_resp_send(req, "Another audio client already connected", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (!audio_ring_init()) {
+      Serial.println("[WS_AUDIO_V2] Ring buffer init failed");
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      return httpd_resp_send(req, "Ring buffer alloc failed", HTTPD_RESP_USE_STRLEN);
+    }
+
+    g_ws_audio_fd     = httpd_req_to_sockfd(req);
+    g_audio_streaming = true;
+    Serial.printf("[WS_AUDIO_V2] Client connected, fd=%d\n", g_ws_audio_fd);
+
+    ws_tune_socket(g_ws_audio_fd);   // ← 新增：TCP_NODELAY / SNDBUF / KEEPALIVE
+
+    // Producer on Core 1 (near PDM)
+    BaseType_t ok1 = xTaskCreatePinnedToCore(
+      audio_capture_task, "aud_cap", 4096, NULL, 5,
+      (TaskHandle_t *)&g_audio_capture_task_h, 1);
+
+    if (ok1 != pdPASS) {
+      Serial.printf("[WS_AUDIO_V2] Capture task create failed err=%d heap=%u\n",
+                    ok1, (unsigned)ESP.getFreeHeap());
+      g_audio_streaming = false;
+      g_ws_audio_fd     = -1;
+      audio_ring_deinit();
+      return ESP_FAIL;
+    }
+
+  
+
+
+
+    // Consumer on Core 0 (near WiFi stack → WS send blocks don't stall PDM)
+    BaseType_t ok2 = xTaskCreatePinnedToCore(
+      audio_sender_task, "aud_snd", 6144, NULL, 6,   //优先级4改成了6
+      (TaskHandle_t *)&g_audio_sender_task_h, 0);
+
+    if (ok2 != pdPASS) {
+      Serial.printf("[WS_AUDIO_V2] Sender task create failed err=%d heap=%u\n",
+                    ok2, (unsigned)ESP.getFreeHeap());
+      g_audio_streaming = false;
+      g_ws_audio_fd     = -1;
+      // capture task will self-exit on flag
+      return ESP_FAIL;
+    }
+
+    Serial.println("[WS_AUDIO_V2] Capture+Sender tasks launched (v5 buffered)");
+    return ESP_OK;
+  }
+
+  // Non-handshake: handle incoming frames (expect only CLOSE)
+  httpd_ws_frame_t pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.type = HTTPD_WS_TYPE_BINARY;
+
+  esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
+  if (ret != ESP_OK) {
+    Serial.printf("[WS_AUDIO_V2] recv_frame error: 0x%x, client disconnected\n", ret);
+    g_audio_streaming = false;
+    g_ws_audio_fd     = -1;
+    return ret;
+  }
+
+  if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
+    Serial.println("[WS_AUDIO_V2] Client sent CLOSE frame");
+    g_audio_streaming = false;
+    g_ws_audio_fd     = -1;
+  }
+
+  if (pkt.len > 0) {
+    uint8_t *temp = (uint8_t *)malloc(pkt.len);
+    if (temp) {
+      pkt.payload = temp;
+      httpd_ws_recv_frame(req, &pkt, pkt.len);
+      free(temp);
+    }
+  }
+  return ESP_OK;
+}
+
+
+// ============================================================
+  // WS socket 调优：降低小包延迟、加大在途窗口、启用 keepalive
+  // 对 WAIC 这种高抖动 WiFi 环境尤其重要。
+  // ============================================================
+  static void ws_tune_socket(int fd) {
+    if (fd < 0) return;
+
+    int one = 1;
+    // 关闭 Nagle：音频 652B 小包不再等合并，直接发
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    // 加大发送缓冲，允许更多在途数据（默认一般 5744B）
+    int sndbuf = 32 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    // TCP keepalive：5s 无流量开始探测，每 2s 一次，3 次失败判死(≈11s)
+    int ka = 1, idle = 5, intvl = 2, cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka,    sizeof(ka));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+
+    Serial.printf("[WS] socket tuned: fd=%d NODELAY=1 SNDBUF=%d KA=%d/%d/%d\n",
+                  fd, sndbuf, idle, intvl, cnt);
+  }
+
+
+
+// ============================================================
 // Server startup
 // ============================================================
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 20; // Increased to accommodate new endpoints
+  config.max_uri_handlers   = 20;    // Increased to accommodate new endpoints
+  config.task_priority      = 6;     // 默认 5，略高于 sender，避免互相阻塞
+  config.stack_size         = 8192;  // 默认 4096，防 WS 处理爆栈
+  config.lru_purge_enable   = true;  // 连接过多时自动淘汰最老
+  config.recv_wait_timeout  = 10;    // 秒
+  config.send_wait_timeout  = 10;    // 秒
 
   // ---- URI definitions ----
 
@@ -1171,6 +1591,17 @@ void startCameraServer() {
     .supported_subprotocol = NULL
   };
 
+  // v5 BUFFERED: ring-buffered + timestamped audio (for duplex_v5 bridge)
+  httpd_uri_t ws_audio_v2_uri = {
+    .uri = "/ws_audio_v2",
+    .method = HTTP_GET,
+    .handler = ws_audio_v2_handler,
+    .user_ctx = NULL,
+    .is_websocket = true,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+  };
+
   // ---- Start server ----
 
   ra_filter_init(&ra_filter, 20);
@@ -1193,8 +1624,9 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &audio_begin_uri);
     httpd_register_uri_handler(camera_httpd, &audio_end_uri);
     httpd_register_uri_handler(camera_httpd, &ws_audio_uri);
+    httpd_register_uri_handler(camera_httpd, &ws_audio_v2_uri);
 
-    Serial.println("[HTTP] Registered: / /capture /bmp /control /status + /audio_begin /audio_end /ws_audio");
+    Serial.println("[HTTP] Registered: / /capture /bmp /control /status + /audio_begin /audio_end /ws_audio /ws_audio_v2");
   }
 
   config.server_port += 1;
