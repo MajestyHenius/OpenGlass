@@ -25,6 +25,7 @@ SmartGlasses 现场演示控制面板 —— ALL（双链路版）
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -1037,6 +1038,32 @@ class ProcManager:
         except Exception:
             pass
 
+    def _llama_port(self):
+        """从 llama_health_url 解析端口，别硬编码 —— 用户改了配置这里要跟着变。"""
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(self.cfg.get("llama_health_url", ""))
+            return u.port or 22500
+        except Exception:
+            return 22500
+
+    def _all_ports(self):
+        """所有需要确认释放的端口。清理时逐个检查，别只盯 gateway。"""
+        c = self.cfg
+        out = [("gateway", c.get("gateway_port", 8006)),
+               ("worker", c.get("worker_ready_port", 22400)),
+               ("llama", self._llama_port()),
+               ("harness", 8021)]
+        # 第一视角：demo / demo_funnel / rokid 各自可能开着
+        for _p in (8080, 18080):
+            out.append(("demo", _p))
+        seen, uniq = set(), []
+        for label, port in out:
+            if port and port not in seen:
+                seen.add(port)
+                uniq.append((label, int(port)))
+        return uniq
+
     def _kill_by_port(self, port):
         if not self.cfg["is_windows"]:
             return
@@ -1235,9 +1262,39 @@ class ProcManager:
         return (self.current_chain, c.get("funnel", 0), self.current_scene,
                 self.current_device, self.current_prompt)
 
+    def _sweep_stale(self):
+        """启动前扫一遍：上次没清干净的残留进程，现在杀掉。
+
+        为什么需要：panel 异常退出、或用户直接关窗口时，子进程可能还活着。
+        它们占着端口，而且 gateway 里的旧 session 还挂着 —— 下次启动的会话
+        就永远卡在 `[GW] queue position=1 eta=0.0`，模型一句话都不回，
+        表面上却是"链路正常、漏斗照常送图"，极难看出问题在哪。
+        （实测踩过，只能重启电脑。）
+        """
+        stale = []
+        for label, port in self._all_ports():
+            if self.procs.get(label) is not None and self._alive(label):
+                continue          # 本次自己起的，不动
+            if self._port_open(port):
+                stale.append((label, port))
+        if not stale:
+            return
+        self._log("gateway", "启动前清理：发现上次残留的端口占用 "
+                  + ", ".join(f"{l}:{p}" for l, p in stale))
+        for label, port in stale:
+            self._kill_by_port(port)
+        time.sleep(1.0)
+        left = [f"{l}:{p}" for l, p in stale if self._port_open(p)]
+        if left:
+            self._log("gateway", "!! 仍被占用: " + ", ".join(left)
+                      + "（可能是别的程序在用这些端口）")
+        else:
+            self._log("gateway", "启动前清理完成，端口已释放")
+
     def _do_start_all(self):
         # ②③④ 的两个前置检查：extensions 复制了没、档位④的 wav 有没有。
         # 提前拦住比跑起来才发现好 —— 后者时 duplex 已在跑，没法当场补。
+        self._sweep_stale()
         if (not self._check_extensions() or not self._check_deps()
                 or not self._check_reject_wav()):
             return
@@ -1299,6 +1356,13 @@ class ProcManager:
         for name in self.chain()["stop_order"]:
             self._kill(name, graceful=(name in tails))
             time.sleep(0.3)
+        # 当前链路的 stop_order 只覆盖这条链；切过链路的话别的进程会漏掉。
+        # 兜底：把 procs 里所有还活着的都停掉。
+        for name in self.cfg["procs"]:
+            if self._alive(name):
+                self._log(name, "不在当前链路但仍在运行，一并停止")
+                self._kill(name, graceful=(name in tails))
+                time.sleep(0.2)
         for name in self.cfg["procs"]:
             proc = self.procs.get(name)
             if proc is not None and proc.poll() is not None:
@@ -1306,13 +1370,33 @@ class ProcManager:
             if proc is not None:
                 self._log(name, "!! 仍在运行，强杀兜底")
                 self._force_kill(proc)
-        if self._wait_port(self.cfg["gateway_port"], up=False, timeout=8):
-            self._log("gateway", f"端口 {self.cfg['gateway_port']} 已释放，全部已停止")
+        # ★ 逐个清理所有已知端口，不只 gateway。
+        #   以前只等 gateway 释放，llama/worker/harness/web_ui 的残留进程会一直
+        #   占着端口；下次启动时 gateway 那边旧 session 还挂着，新会话就永远
+        #   卡在 `[GW] queue position=1 eta=0.0` —— 表现是"链路看着活的、
+        #   漏斗照常送图，但模型一句话都不回"，只能重启电脑。
+        for _label, _port in self._all_ports():
+            if self._wait_port(_port, up=False, timeout=4):
+                continue
+            self._log(_label, f"!! 端口 {_port} 仍被占用，按端口强杀")
+            self._kill_by_port(_port)
+        # 再确认一遍；还占着就再杀一次（有些进程要两拍才退）
+        _still = [(l, p) for l, p in self._all_ports()
+                  if not self._wait_port(p, up=False, timeout=2)]
+        for _label, _port in _still:
+            self._log(_label, f"!! 端口 {_port} 二次强杀")
+            self._kill_by_port(_port)
+            time.sleep(0.5)
+        _left = [f"{l}:{p}" for l, p in self._all_ports()
+                 if not self._wait_port(p, up=False, timeout=1)]
+        if _left:
+            self._log("gateway", "!! 以下端口仍被占用，可能需要手动处理: "
+                                 + ", ".join(_left))
         else:
-            self._log("gateway", f"!! {self.cfg['gateway_port']} 仍被占用，尝试按端口强杀")
-            self._kill_by_port(self.cfg["gateway_port"])
+            self._log("gateway", "所有端口已释放，全部已停止")
         for name in self.cfg["procs"]:
             self.status[name] = "stopped"
+            self._forget_tail_fp(name)
 
     def stop_all(self):
         """全部停止：等同三个 Ctrl+C。先发急停打断任何正在进行的启动，再彻底杀干净。"""
@@ -1495,11 +1579,32 @@ def main():
         height=780,
         min_size=(900, 640),
     )
-    webview.start()
-    # 关窗时兜底：确保所有子进程被清掉
-    mgr.shutdown()
-    #mgr.stop_all()
-    #time.sleep(1)
+    # 兜底 ①：进程正常退出时（含异常传播）一定会跑
+    import atexit
+    atexit.register(mgr.shutdown)
+
+    # 兜底 ②：Ctrl+C / 控制台关闭
+    def _sig_cleanup(signum, frame):
+        try:
+            mgr.shutdown()
+        finally:
+            os._exit(0)
+    for _s in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        _sv = getattr(signal, _s, None)
+        if _sv is not None:
+            try:
+                signal.signal(_sv, _sig_cleanup)
+            except Exception:
+                pass
+
+    try:
+        webview.start()
+    finally:
+        # 兜底 ③：webview 抛异常时也要清
+        #   以前只在 start() 之后直接调 shutdown()，异常路径下压根不执行 ——
+        #   于是 llama/worker/gateway/harness 全留着，端口占着、
+        #   gateway 里旧 session 挂着，下次启动永远卡在 queue position=1。
+        mgr.shutdown()
 
 
 if __name__ == "__main__":

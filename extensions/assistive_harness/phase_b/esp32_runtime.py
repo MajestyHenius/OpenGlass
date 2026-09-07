@@ -1044,6 +1044,32 @@ async def esp32_image_loop(
                     finally:
                         _hint_playing = False
 
+                _USER_STOP_AUTO_RESUME_S = 20.0   # 用户 STOP 后多久自动恢复对话
+
+                async def _auto_resume_later(cnt_at_stop):
+                    """用户在提示音期间按了 STOP —— 尊重它，但别永久锁死。
+
+                    等一段时间后，如果 stop_count 没再变（说明用户没有反复要求
+                    停止），就自动 resume，让系统回到可对话状态。
+                    期间若又有新的 stop，放弃这次兜底（由那次的兜底接手）。
+                    """
+                    try:
+                        await asyncio.sleep(_USER_STOP_AUTO_RESUME_S)
+                    except asyncio.CancelledError:
+                        return
+                    _g = getattr(manager, "gate", None)
+                    now = getattr(_g, "stop_count", None) if _g else None
+                    if now is not None and now != cnt_at_stop:
+                        LOG.debug("[强制措施] 自动恢复取消：期间又有新的 STOP")
+                        return
+                    try:
+                        await harness.send({"type": "funnel.resume",
+                                            "reason": "user_stop_timeout"})
+                        LOG.info("[强制措施] 用户 STOP 已过 %.0fs，自动恢复对话",
+                                 _USER_STOP_AUTO_RESUME_S)
+                    except Exception as e:
+                        LOG.warning("[强制措施] 自动恢复失败: %s", e)
+
                 async def _do_reject_interrupt_inner(reason):
                     wav_pcm = _load_reject_wav(reject_wav_dir, reason)
                     if wav_pcm is None:
@@ -1057,13 +1083,19 @@ async def esp32_image_loop(
                     #   就把用户的停止状态覆盖掉了。
                     #   （播报改成后台任务之后，这个并发窗口更大了。）
                     _gate = getattr(manager, "gate", None)
-                    _owned = getattr(_gate, "stop_count", None) if _gate else None
                     try:
                         await harness.send({"type": "funnel.stop", "reason": reason})
                         LOG.info("[强制措施] funnel.stop 已发 (%s)", reason)
                     except Exception as e:
                         LOG.warning("[强制措施] funnel.stop 失败: %s", e)
                     await asyncio.sleep(0.35)  # 等 STOP 经 8021→rokid→block_and_flush
+                    # ★ 必须在上面这个 sleep **之后**读 stop_count 作为所有权凭据。
+                    #   funnel.stop 是异步生效的（8021→rokid→gate.stop()），
+                    #   在发送**之前**读的话，自己这一次 stop 也会把计数器 +1，
+                    #   于是播完时 _now != _owned 恒成立 —— resume 一次都发不出去，
+                    #   模型永远停着，说什么都进不去（实测：开局第一次 reject 就锁死，
+                    #   只能靠 harness 那条腿说"恢复对话"才能救回来）。
+                    _owned = getattr(_gate, "stop_count", None) if _gate else None
                     try:
                         await speaker.resume()
                         await speaker.enqueue(wav_pcm, generation=0)
@@ -1078,6 +1110,11 @@ async def esp32_image_loop(
                     # 有新的 stop 进来（用户按的），此时保持停止状态不动。
                     _now_cnt = getattr(_gate, "stop_count", None) if _gate else None
                     if _owned is not None and _now_cnt is not None and _now_cnt != _owned:
+                        # 用户的 STOP 优先，但**不能永远停着** —— 用户按"停一下"
+                        # 是想让当前这句别说了，不是想让系统从此哑掉。
+                        # 挂一个兜底：过 _USER_STOP_AUTO_RESUME_S 之后，若期间
+                        # 没有再新增 stop，就自动恢复对话。
+                        asyncio.create_task(_auto_resume_later(_now_cnt))
                         LOG.info("[强制措施] 播报期间收到新的 STOP"
                                  "（stop_count %s→%s），保留用户的停止状态，不 resume",
                                  _owned, _now_cnt)
