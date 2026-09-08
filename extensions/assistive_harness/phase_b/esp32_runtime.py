@@ -1044,7 +1044,7 @@ async def esp32_image_loop(
                     finally:
                         _hint_playing = False
 
-                _USER_STOP_AUTO_RESUME_S = 20.0   # 用户 STOP 后多久自动恢复对话
+                _USER_STOP_AUTO_RESUME_S = 1.5   # 用户 STOP 后多久自动恢复对话
 
                 async def _auto_resume_later(cnt_at_stop):
                     """用户在提示音期间按了 STOP —— 尊重它，但别永久锁死。
@@ -1525,7 +1525,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         self.manager.handle_result = _wrapped_handle_result
 
     async def _gate_open_when_ready(self, ready_evt: asyncio.Event) -> None:
-        """等 gateway 就绪后放行回放任务。"""
+        """等 gateway 就绪后放行音视频任务（live 和 rerun 共用）。"""
         try:
             await self._wait_gateway_ready()
         finally:
@@ -1533,7 +1533,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             # 会把排队那几十秒也算进去，两个 arm 无法对齐。
             if self.live_rec is not None:
                 self.live_rec.start()
-                LOG.info("[LIVE] rerun 录制已开（就绪后启动，结束自动出 mp4）")
+                LOG.info("[LIVE] 录制已开（gateway 就绪后启动，结束自动出 mp4）")
             # 统一回放零点：音频按 40ms 绝对时钟推、图按 frames.jsonl 的 t 等待，
             # 两者必须用同一个 t0，否则各自以"自己被调度到的那一刻"为零点，
             # 起跑差多少全看事件循环，音图就对不齐。
@@ -1712,9 +1712,17 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             LOG.info("[ESP32] 设分辨率 1280×720(UXGA档): %s",
                      "成功" if ok else "失败(检查ESP32 /control)")
             await asyncio.sleep(0.3)  # 切分辨率后固件重配，稍等
-        if self.live_rec is not None:
-            self.live_rec.start()
-            LOG.info("[LIVE] -o record started")
+        # 就绪门：等 duplex session 真正 running 再开始推音视频。
+        #   两个 rerun 分支早就有这个（见 _gate_open_when_ready），live 分支漏了。
+        #   panel 判 gateway 就绪的依据只是"端口开了"，而 gateway 绑上端口之后
+        #   还要十几秒才能接会话（日志里 gateway=preparing 持续到 10:43:49）。
+        #   这期间 image_loop 照常抓图、audio_reader 照常推音频：
+        #     · 音频推给一个还不存在的 session → queue=96 塞满、drops 一路涨到 552
+        #     · 队列操作和重试占住事件循环 → capture 的 1s 超时到点 → 连续掉图
+        #     · 掉够次数就判 no_frames → 停模型播"没有拿到画面"
+        #   现象就是"开头一段时间画面丢失 + 模型不回话"，gateway 一 running 就自愈。
+        _ready = asyncio.Event()
+        asyncio.create_task(self._gate_open_when_ready(_ready))
         self._tasks = [
             # ── 继承自 rokid 的三个骨架 task ──
             asyncio.create_task(self.harness.run()),
@@ -1728,6 +1736,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                 self.config.input_gain, self._stop_evt,
                 probe=self._probe,
                 live_rec=self.live_rec,
+                ready_evt=_ready,
             )),
             asyncio.create_task(esp32_image_loop(
                 self._tcp_img, self.latest_frame, self.harness, self.stats,
@@ -1742,6 +1751,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                 live_rec=self.live_rec,
                 web_ui=self._web_ui,
                 no_reject=self._no_reject,
+                ready_evt=_ready,
             )),
         ]
 
