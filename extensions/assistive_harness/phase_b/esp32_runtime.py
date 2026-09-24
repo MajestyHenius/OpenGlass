@@ -352,7 +352,14 @@ async def esp32_audio_reader(
     stop_evt: asyncio.Event,
     probe=None,
     live_rec=None,
+    ready_evt: Optional[asyncio.Event] = None,
 ) -> None:
+    # 等 duplex session 就绪再推，否则排队期间的音频全丢（见 _wait_gateway_ready）。
+    # 两个 rerun 分支早就有这个门（走的是 rerun_audio_reader），live 分支之前漏了：
+    # gateway 绑上端口 ≠ 能接会话，preparing 期间推进来的音频只会把队列塞满、
+    # drops 一路涨，还会拖住事件循环导致取图超时。
+    if ready_evt is not None:
+        await ready_evt.wait()
     url = f"ws://{host}:{port}/ws_audio_v2"
     LOG.info("[ESP32] audio WS: %s", url)
     backoff = 1.0
@@ -899,8 +906,26 @@ async def esp32_image_loop(
     peer_done: Optional[asyncio.Event] = None,
     done_evt: Optional[asyncio.Event] = None,
 ) -> None:
-    if ready_evt is not None:
-        await ready_evt.wait()
+    # ★ 这里**不等** ready_evt。
+    #   就绪门的本意是"别把音视频推给还没建好的会话"，不是"别抓图"。
+    #   抓图、漏斗判定、推第一视角都是纯本地的，挡在这里只会让
+    #   panel 内嵌的第一视角在 gateway 就绪前（20~30s）一片空白 ——
+    #   而眼镜自己的 http://<ip> stream 一点就有画面，对比之下像是坏了。
+    #   真正需要等的是下面"送图给模型"那一步，见 _gate_ready() 的用法。
+    _model_gate = ready_evt
+    _gate_logged = False
+
+    async def _wait_model_ready():
+        """送图给模型之前调用：会话没就绪就等，等的时候只打一次日志。"""
+        nonlocal _gate_logged
+        if _model_gate is None or _model_gate.is_set():
+            return
+        if not _gate_logged:
+            _gate_logged = True
+            LOG.info("[ESP32] 会话尚未就绪，图像先只走本地（第一视角/录制），"
+                     "就绪后再开始送模型")
+        await _model_gate.wait()
+
     LOG.info("[ESP32] image loop start (interval=%.2fs, funnel=%s)",
              interval_s, "on" if funnel else "off")
     _last_grab_mono = None
@@ -985,10 +1010,15 @@ async def esp32_image_loop(
                 grab_ms = (time.monotonic() - t0) * 1000.0
                 if jpeg:
                     ts = now_ms()
+                    # 第一视角先推 —— 它是纯本地的，不该等会话。
+                    # （web_ui 用的是 latest_frame.sequence 之前的值，差一个序号
+                    #   不影响显示；换来的是开机就有画面，而不是空白 20~30s。）
+                    _emit_chunk_img(web_ui, jpeg, latest_frame.sequence + 1, True)
+                    # 送给模型之前才等会话就绪
+                    await _wait_model_ready()
                     latest_frame.set(jpeg, ts)
                     stats.image_count += 1
                     await harness.send_frame(jpeg, latest_frame.sequence, ts)
-                    _emit_chunk_img(web_ui, jpeg, latest_frame.sequence, True)
                     if probe is not None:
                         since_last = (t0 - _last_grab_mono) * 1000.0 if _last_grab_mono else 0.0
                         probe.mark_grab(latest_frame.sequence, grab_ms, len(jpeg), since_last)
@@ -1027,6 +1057,27 @@ async def esp32_image_loop(
                         LOG.warning("[LIVE] on_funnel_round err: %s", e)
                 grab_ms = decision.timings.get("grab_ms", 0.0)
                 async def _do_reject_interrupt(reason):
+                    """外壳：保证"发了 stop 就一定有人负责 resume"。
+
+                    里层 _inner 有几处 await（sleep 0.35、播报、sleep(dur)）。
+                    这个协程是 create_task 起的，运行时收尾或任务被取消时，
+                    CancelledError 会从任意一处 await 抛出 —— 那时 funnel.stop
+                    可能已经发出去了，而 resume 永远发不出去，系统就哑在那儿。
+                    所以这里兜一层：被取消就立刻补一次 resume。
+                    （正常超时的情况由 _stop_watchdog 兜底，两者互不替代。）
+                    """
+                    try:
+                        await _do_reject_interrupt_shell(reason)
+                    except asyncio.CancelledError:
+                        LOG.warning("[强制措施] 播报被取消，补发 funnel.resume 以免卡在停止态")
+                        try:
+                            await harness.send({"type": "funnel.resume",
+                                                "reason": "hint_cancelled"})
+                        except Exception:
+                            pass
+                        raise
+
+                async def _do_reject_interrupt_shell(reason):
                     """真正执行打断：停 duplex → 播 wav → 恢复。
 
                     **在后台任务里跑，不能让 image_loop 同步等它**：
@@ -1044,7 +1095,7 @@ async def esp32_image_loop(
                     finally:
                         _hint_playing = False
 
-                _USER_STOP_AUTO_RESUME_S = 1.5   # 用户 STOP 后多久自动恢复对话
+                _USER_STOP_AUTO_RESUME_S = 20.0   # 用户 STOP 后多久自动恢复对话
 
                 async def _auto_resume_later(cnt_at_stop):
                     """用户在提示音期间按了 STOP —— 尊重它，但别永久锁死。
@@ -1133,10 +1184,13 @@ async def esp32_image_loop(
                     _b = decision.best
                     if _b:
                         ts = now_ms()
+                        # 第一视角先推，不等会话（纯本地）
+                        _emit_chunk_img(web_ui, _b, latest_frame.sequence + 1, True)
+                        # 送给模型之前才等会话就绪
+                        await _wait_model_ready()
                         latest_frame.set(_b, ts)
                         stats.image_count += 1
                         await harness.send_frame(_b, latest_frame.sequence, ts)
-                        _emit_chunk_img(web_ui, _b, latest_frame.sequence, True)
                         if live_rec is not None:
                             try:
                                 await asyncio.to_thread(
@@ -1179,6 +1233,8 @@ async def esp32_image_loop(
 
                 if decision.send and decision.best:
                     ts = now_ms()
+                    # 送给模型之前才等会话就绪（抓图/第一视角/录制不受影响）
+                    await _wait_model_ready()
                     latest_frame.set(decision.best, ts)
                     stats.image_count += 1
                     await harness.send_frame(decision.best, latest_frame.sequence, ts)
@@ -1192,8 +1248,15 @@ async def esp32_image_loop(
                             LOG.warning("[LIVE] on_frame err: %s", e)
                     # 注意：send 不清 _pending_reject，保护期只看到标点那一刻
                 else:
-                    LOG.info("[漏斗] reject(%s) -> hint: %s",
-                             decision.reason, decision.hint)
+                    # 带上判据实测值：阈值(SEVERE_FLOW 等)至今没用 shake 样本正式
+                    # 标定过，只有把每次 reject 的真实数值打出来，才能从实跑数据里
+                    # 看出该往哪调，而不是凭体感来回试。
+                    _sg = getattr(decision, "seg", None) or {}
+                    LOG.info("[漏斗] reject(%s) -> hint: %s  "
+                             "[flow=%s stable=%s sharp=%s light=%s]",
+                             decision.reason, decision.hint,
+                             _sg.get("flow", "-"), _sg.get("stable", "-"),
+                             _sg.get("sharp", "-"), _sg.get("light", "-"))
                     if live_rec is not None:
                         live_rec.log_event("REJECT", f"{decision.reason} {decision.hint or ''}")
                     if force_measure and speaker is not None and decision.reason != "need_focus":
@@ -1317,6 +1380,22 @@ async def esp32_image_loop(
         try:
             await asyncio.wait_for(stop_evt.wait(), timeout=max(0.0, interval_s - elapsed))
         except asyncio.TimeoutError:
+            pass
+    # 收尾时报一次方向分类器的推理统计。
+    #   加载成功只保证"能用"，每一轮推理都可能单独失败并退回早期 CV 判据 ——
+    #   那条降级路径原先只 print，跑完根本不知道发生过多少次。
+    #   失败次数 > 0 就说明这次运行里有轮次用的是早期判据，orient 判定不可信。
+    if funnel is not None:
+        try:
+            from .cam_pipeline_v2 import orient_infer_stats
+            _ok_n, _fail_n = orient_infer_stats()
+            if _fail_n:
+                LOG.warning("[orient] 本次推理 成功 %d / 失败 %d —— "
+                            "失败的那些轮退回了早期 CV 判据，orient 结论不可信",
+                            _ok_n, _fail_n)
+            else:
+                LOG.info("[orient] 本次推理 成功 %d / 失败 0", _ok_n)
+        except Exception:
             pass
     LOG.info("[ESP32] image loop stopped")
 
@@ -1524,6 +1603,117 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
 
         self.manager.handle_result = _wrapped_handle_result
 
+    # ── 停止态看门狗 ───────────────────────────────────────────────────
+    #   问题：进入"停止说话"状态的路径有好几条，退出却只有少数几条，
+    #         任何一条断掉系统就永久哑掉，而使用者只会看到"它不理我了"。
+    #
+    #   已知会进入停止态的：
+    #     ① 用户说"停一下"        → harness → stop_speech → gate.stop()
+    #     ② 漏斗 reject 播提示音   → funnel.stop → 同上
+    #     ③ 技能切换/重新开始途中  → restart 里先 stop_speech
+    #
+    #   已知能退出的：
+    #     ① 用户说"恢复对话"       → resume_speech
+    #     ② 漏斗提示播完           → funnel.resume
+    #     ③ restart 成功           → replacement_ready()
+    #
+    #   漏洞（实测都踩过）：
+    #     · ① 进、没人出：安静时说"停一下"不经过漏斗播报，没有任何超时兜底。
+    #       实测 STOP event=17 之后 67 秒没有 RESUME，直到 keepalive 超时断链。
+    #     · ② 进、播报中途抛异常：resume 发不出去。
+    #     · ③ 会话 failed 后普通重连不调 replacement_ready()，
+    #       新会话起来了但 speech_hold_active 还是 True，输出照样被丢。
+    #
+    #   所以这里用一个**与进入路径无关**的看门狗兜底：只看"停了多久"。
+    #   它不替代上面任何一条正常退出路径，只保证系统不会永久卡住。
+    STOP_WATCHDOG_S = 12.0        # 停止态超过这么久就自动恢复
+    STOP_WATCHDOG_TICK_S = 1.0    # 轮询间隔
+
+    async def _stop_watchdog(self) -> None:
+        gate = getattr(self.manager, "gate", None)
+        if gate is None:
+            LOG.warning("[看门狗] 拿不到 gate，停止态兜底未启用")
+            return
+        held_since = None          # 进入停止态的时刻
+        held_count = None          # 进入时的 stop_count（用来识别"新的一次停止"）
+        last_sid = None            # 上一次看到的 session_id（用来发现"换了会话"）
+        while not self._stop_evt.is_set():
+            try:
+                await asyncio.wait_for(self._stop_evt.wait(),
+                                       timeout=self.STOP_WATCHDOG_TICK_S)
+                return             # stop_evt 置位 = 整个运行时要退出了
+            except asyncio.TimeoutError:
+                pass
+            holding = bool(getattr(gate, "speech_hold_active", False))
+            cnt = getattr(gate, "stop_count", 0)
+
+            # 会话换了（断线重连、或 300s 上限重建）——
+            #   restart_session 那条路径会调 gate.replacement_ready() 清停止态，
+            #   但**普通重连不会**：新会话起来了，speech_hold_active 还是 True，
+            #   模型输出照样被丢，使用者看到的是"重连成功了但还是不说话"。
+            #
+            #   ★ 两个必须满足的前提，缺一个就会抢跑：
+            #   ① gate.restart_in_progress 为 False。
+            #      技能切换/重新开始的正常流程是「先 stop → 建新会话 →
+            #      replacement_ready() 一次性恢复」。restart 期间 session_id
+            #      早就换成新对象了，这时候插一脚 resume，等于把 restart 的
+            #      "停"提前解除 —— 实测会看到 RESUME 出现在 prepared 之前
+            #      3 秒，那几秒里旧 generation 的输出不再被丢弃。
+            #   ② 新会话 status == "running"（真正 prepared 了）。
+            #      session_id 变了只说明对象换了，可能还在 connecting/preparing。
+            _act = getattr(self.manager, "active", None)
+            sid = getattr(_act, "session_id", None) if _act is not None else None
+            sess_ready = getattr(_act, "status", None) == "running" if _act else False
+            restarting = bool(getattr(gate, "restart_in_progress", False))
+            if sid is not None and sid != last_sid:
+                if last_sid is not None and holding and sess_ready and not restarting:
+                    LOG.warning("[看门狗] 会话已重建(%s→%s)且已就绪，但仍处于停止态，"
+                                "立即恢复", str(last_sid)[:8], str(sid)[:8])
+                    try:
+                        await self.harness.send({"type": "funnel.resume",
+                                                 "reason": "session_rebuilt"})
+                    except Exception:
+                        try:
+                            gate.resume()
+                            await self.speaker.resume()
+                        except Exception as e:
+                            LOG.error("[看门狗] 会话重建后恢复失败: %s", e)
+                    held_since = held_count = None
+                if sess_ready:
+                    last_sid = sid        # 只在就绪后才记账，避免中间态被当成"已换"
+                continue
+
+            # restart 进行中：整个停止态由 restart 自己负责（replacement_ready），
+            # 看门狗完全让开，连超时计时都不启动。
+            if restarting:
+                held_since = held_count = None
+                continue
+            if not holding:
+                held_since = held_count = None
+                continue
+            if held_since is None or cnt != held_count:
+                # 刚进入停止态，或期间又停了一次 —— 重新计时
+                held_since, held_count = time.monotonic(), cnt
+                continue
+            if time.monotonic() - held_since < self.STOP_WATCHDOG_S:
+                continue
+            # 停够久了：恢复。注意走 harness 那条腿，和正常的 resume 同一条路径，
+            # 这样 harness 侧的状态（ack/telemetry）也保持一致。
+            LOG.warning("[看门狗] 已停止 %.0fs 无人恢复，自动恢复对话"
+                        "（stop_count=%s）。正常情况下应由'恢复对话'或漏斗提示播完触发。",
+                        self.STOP_WATCHDOG_S, cnt)
+            try:
+                await self.harness.send({"type": "funnel.resume",
+                                         "reason": "watchdog_timeout"})
+            except Exception as e:
+                LOG.warning("[看门狗] 经 harness 恢复失败(%s)，直接清本地状态", e)
+                try:
+                    gate.resume()
+                    await self.speaker.resume()
+                except Exception as e2:
+                    LOG.error("[看门狗] 本地恢复也失败: %s", e2)
+            held_since = held_count = None
+
     async def _gate_open_when_ready(self, ready_evt: asyncio.Event) -> None:
         """等 gateway 就绪后放行音视频任务（live 和 rerun 共用）。"""
         try:
@@ -1637,6 +1827,10 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                 asyncio.create_task(self.harness.run()),
                 asyncio.create_task(self._initial_session_loop()),
                 asyncio.create_task(self._stats_loop()),
+                # 停止态兜底：任何来源的 STOP 只要超时没人恢复，就自动恢复。
+                # 三条分支（live / rerun / funnel-rerun）都要挂，缺一条就有
+                # 一条路径会永久哑掉。
+                asyncio.create_task(self._stop_watchdog()),
                 asyncio.create_task(rerun_audio_reader(
                     self._rerun_from,
                     self.manager, self.harness,
@@ -1675,6 +1869,10 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                 asyncio.create_task(self.harness.run()),
                 asyncio.create_task(self._initial_session_loop()),
                 asyncio.create_task(self._stats_loop()),
+                # 停止态兜底：任何来源的 STOP 只要超时没人恢复，就自动恢复。
+                # 三条分支（live / rerun / funnel-rerun）都要挂，缺一条就有
+                # 一条路径会永久哑掉。
+                asyncio.create_task(self._stop_watchdog()),
                 asyncio.create_task(rerun_audio_reader(
                     self._funnel_rerun_from,
                     self.manager, self.harness,
@@ -1728,6 +1926,10 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             asyncio.create_task(self.harness.run()),
             asyncio.create_task(self._initial_session_loop()),
             asyncio.create_task(self._stats_loop()),
+            # 停止态兜底：任何来源的 STOP 只要超时没人恢复，就自动恢复。
+            # 三条分支（live / rerun / funnel-rerun）都要挂，缺一条就有
+            # 一条路径会永久哑掉。
+            asyncio.create_task(self._stop_watchdog()),
             # ── ESP32 特有：主动拉取音视频 ──
             asyncio.create_task(esp32_audio_reader(
                 self._esp32_host, self._esp32_port,

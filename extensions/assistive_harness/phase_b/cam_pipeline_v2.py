@@ -366,8 +366,16 @@ class FunnelConfig:
     # 稳定性优先三出口的门限 (段级中位数上判定; 待真机 rerun 校准)
     STABLE_MIN = 0.35     # 出口A: g_stable 低于此 = 持续在动 -> "请拿稳" (第一闸)。
                           #   从0.45降到0.35: 配合 motion_ref=15, 让OCR证实可读的密集字面通过, 修复误拒。
-    SEVERE_FLOW = 8.0     # 出口A0: 段级光流位移(像素)>=此 = 严重晃动一刀切拒绝。初值8,
-                          #   待 shake 样本校准("多大位移算严重"); 光流位移物理可解释。
+    SEVERE_FLOW = 22.0    # 出口A0: 段级光流位移(像素)>=此 = 严重晃动一刀切拒绝。
+                          #   8.0 是未经校准的初值（原注释写着"待 shake 样本校准"）。
+                          #   实机体验：戴在头上正常看东西就会反复触发 —— 头部的自然
+                          #   微动本来就有几个像素的光流，8 太靠近它了。而每次触发都
+                          #   会停模型、播提示，对话被切碎，远比"偶尔念糊一张"更糟。
+                          #   实测拿到的 reject 样本 seg_flow 在 20~24：那几次确实在晃，
+                          #   但"扫视桌面找东西"的转头动作也落在同一量级 —— 这个指标
+                          #   区分不开两者。念药盒时用户会刻意停稳，22 仍能拦住糊到
+                          #   念不了的；再严就会把必要的取景动作也拦掉。
+                          #   ⚠ 仍未用 shake 样本正式标定，是按实测分布 + 体验定的。
     LIGHT_MIN = 0.35      # 出口D(留): g_light 低于此且为最差 -> 太暗
     CONTENT_MIN = 0.30    # 出口E(留): g_content 低于此
     SHARP_OK_FOR_E = 0.45 # 出口E(留): 判"没对准"要求 sharp 够高(清晰却没字才算对错)
@@ -392,8 +400,11 @@ def make_scene_config(scene: str = "medicine") -> "FunnelConfig":
                                  #   手动定: csv里 worst_block 对ok/blur区分很弱(图都较清晰,
                                  #   AUC~0.52), 算不出可靠值, 按"文具比药盒松"手动定松一档。
         cfg.ACCEPT_Q = 0.48      # 略放松(药盒0.55): 安全低, 容错高一点。
-        cfg.SEVERE_FLOW = 8.0    # 沿用药盒: csv 里 seg_flow 是最强判据(AUC~0.71), >8 后
-                                 #   ok率骤降, 与药盒一致。晃动是通用物理约束, 不随场景放松。
+        cfg.SEVERE_FLOW = 30.0   # 比药盒(22)再松一档。
+                                 #   csv 里 seg_flow 确实是最强判据(AUC~0.71)，但那批样本
+                                 #   是手持拍摄；戴在头上时基线运动更大。生活用品安全等级低、
+                                 #   念糊一次代价小，而反复打断对话的代价大。
+                                 #   30 基本只拦"甩头"那种，找东西的正常转头不再打断。
         return cfg
     # 未知场景 -> 退回药盒默认, 并提示
     print(f"[scene] 未知场景 '{scene}', 用药盒默认配置")
@@ -647,6 +658,23 @@ _PAN_HINT = {"top": "请向上看一点", "bottom": "请向下看一点",
 _ORI_CLS = None            # 方向分类器单例(全局只加载一次)
 _ORI_CLS_TRIED = False     # 是否已尝试加载(避免反复重试失败)
 _ORI_CLS_ERR = ""          # 加载失败原因(供上层如实报告，不要只看"预热就绪")
+_ORI_INFER_OK = 0          # 分类器推理成功次数
+_ORI_INFER_FAILS = 0       # 分类器推理失败次数(每次失败都会让那一轮退回早期判据)
+
+try:
+    import logging as _logging
+    LOGGER = _logging.getLogger("cam_pipeline_v2")
+except Exception:      # pragma: no cover
+    class _P:
+        def warning(self, *a):
+            print(a[0] % a[1:] if len(a) > 1 else a[0])
+        info = debug = warning
+    LOGGER = _P()
+
+
+def orient_infer_stats():
+    """(成功次数, 失败次数)。失败次数 > 0 就说明有轮次退回了早期判据。"""
+    return _ORI_INFER_OK, _ORI_INFER_FAILS
 
 
 def orient_classifier_status():
@@ -673,7 +701,18 @@ def _get_orient_classifier():
     # 加载方向分类器。优先用最简单的写法(实测 SmartGlasses 环境可用, 与 torch 不冲突 ——
     #   当初冲突的是完整 PaddleOCR-GPU 识别, 不是这个轻量方向分类器)。
     #   若想显式指定设备, 后面的参数变体作为备选依次尝试。
-    from paddleocr import DocImgOrientationClassification
+    # ★ 导入必须包在 try 里：这一句在 try 外面的话，导入失败会直接抛到调用方，
+    #   而调用方（_classify_orientation）只 catch 了 predict 那一段 ——
+    #   整个漏斗会崩，不是降级。实测 paddleocr 的导入链
+    #   （paddlex → modelscope → torch）在 torch 装坏的机器上就会抛 ImportError。
+    global _ORI_CLS_ERR
+    try:
+        from paddleocr import DocImgOrientationClassification
+    except Exception as e:
+        _ORI_CLS_ERR = f"{type(e).__name__}: {e}"
+        print(f"[orient] 方向分类器导入失败，方向判定将整体跳过（不再回退早期判据）: {e}")
+        _ORI_CLS = None
+        return None
     last_err = None
     for kw in (dict(model_name="PP-LCNet_x1_0_doc_ori"),                    # 最简单(原来能用的)
                dict(model_name="PP-LCNet_x1_0_doc_ori", device="cpu"),     # 显式CPU(可选)
@@ -685,9 +724,8 @@ def _get_orient_classifier():
         except Exception as e:
             last_err = e
             continue                           # 这个参数组合不行, 换下一个
-    global _ORI_CLS_ERR
     _ORI_CLS_ERR = f"{type(last_err).__name__}: {last_err}"
-    print(f"[orient] 方向分类器加载失败, 回退到轻量CV判据: {last_err}")
+    print(f"[orient] 方向分类器加载失败，方向判定将整体跳过（不再回退早期判据）: {last_err}")
     _ORI_CLS = None
     return None
 
@@ -705,6 +743,7 @@ _ORIENT_MAP = {
 
 def _classify_orientation(img_bgr):
     """用分类器判方向。返回 (raw_label, conf) 或 (None, 0) 若不可用/低置信。"""
+    global _ORI_INFER_OK, _ORI_INFER_FAILS
     cls = _get_orient_classifier()
     if cls is None:
         return None, 0.0
@@ -715,9 +754,19 @@ def _classify_orientation(img_bgr):
         scores = r.get("scores", [0.0])
         raw = str(labels[0]).replace("_degree", "").strip()
         conf = float(max(scores)) if scores else 0.0
+        _ORI_INFER_OK += 1
         return raw, conf
     except Exception as e:
-        print(f"[orient] 推理失败: {e}")
+        # ★ 推理失败是**静默降级**的主要入口，必须让上层看见。
+        #   原来只 print，那行不进 run.log，在 panel 日志里也淹没在一堆输出中；
+        #   而降级之后走的是早期 CV 判据（对桌面场景基本不可用），
+        #   表现就是"一开始判得好好的，跑一会儿就总说画面反了"。
+        #   加载成功≠一直可用：加载只做一次，推理每轮都做，任何一轮抛异常
+        #   都会让**这一轮**退回早期判据。
+        _ORI_INFER_FAILS += 1
+        if _ORI_INFER_FAILS <= 3 or _ORI_INFER_FAILS % 20 == 0:
+            LOGGER.warning("[orient] 分类器推理失败(第 %d 次，本轮退回早期 CV 判据): %r",
+                           _ORI_INFER_FAILS, e)
         return None, 0.0
 
 
@@ -751,13 +800,21 @@ def process_orientation(best_jpg: bytes):
         # 分类器给了结果但低置信 -> 不硬判
         orient_state = "uncertain"
     else:
-        # 分类器不可用 -> 回退轻量CV判据(整块投影/注水容量)
-        side, side_ratio = _detect_sideways(gray)
-        if side == "sideways":
-            orient_state, orient_hint = "sideways", "请把药盒转90°"
-        else:
-            ud, ud_score = _detect_upside_down(gray)
-            orient_state = {"flipped": "flipped", "upright": "upright"}.get(ud, "uncertain")
+        # 分类器不可用 -> **什么都不做，直接放行**（uncertain 在 funnel_gate 里是放行）。
+        #
+        # 这里原来会回退到 _detect_sideways / _detect_upside_down（整块投影 + 注水容量）。
+        # 那两个是早期实现，对**白底黑字的文档**还有六成准，但对佩戴视角下的真实场景
+        # （桌面、马路、货架）基本是乱判 —— 实测画面明明是正的却持续报
+        # "药盒拿反了，请上下翻转"，而每次都会停模型、播提示，把对话切碎。
+        #
+        # 判断原则：方向判据的价值在于"念字之前别念反"，它是**锦上添花**；
+        # 判错的代价（反复打断 + 让用户做无意义的翻转动作）远大于漏判
+        # （模型看到一张倒的图，顶多这次念不准）。所以分类器不可用时
+        # **宁可不判也不要乱判** —— 不拖累链路，正常走下去。
+        #
+        # _detect_sideways / _detect_upside_down 保留在文件里（-v 时代的工具还在用），
+        # 但不再作为 -o 链路的兜底。
+        orient_state = "uncertain"
 
     # 取景完整性(截断) —— 显示层暂关, 接口保留
     edges, truncated = _detect_truncation(gray)

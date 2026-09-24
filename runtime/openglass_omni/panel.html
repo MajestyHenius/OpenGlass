@@ -164,6 +164,11 @@
 
 <script>
 let CFG = null, curTab = "llama", fpvOn = false, selectedPreset = null, curChain = "esp32";
+// iframe 是在 panel 启动时就挂的（见 init 里的 toggleFpv），那会儿第一视角
+// 服务（8080）还没起来，加载失败后浏览器**不会重试** —— 所以哪怕后端已经
+// 在推帧，画面也一直是空的，非得手动「关闭画面」再「开启画面」重挂一次。
+// 这里记住上一次是不是全绿，在刚变全绿的那一刻自动重挂。
+let lastAllRunning = false;
 
 async function init(){
   CFG = await window.pywebview.api.get_config();
@@ -281,6 +286,17 @@ function toggleFpv(){
     btn.textContent = "开启画面"; btn.classList.remove("on");
   }
 }
+// 等价于手动点「关闭画面」再点「开启画面」：强制重新加载 iframe。
+// 加时间戳是因为上一次加载失败的结果可能被浏览器缓存住。
+function remountFpv(){
+  if(!CFG) return;
+  const url = CFG.chains[curChain].fpv_url;
+  document.getElementById("fpvBody").innerHTML =
+    `<iframe src="${url}?t=${Date.now()}"></iframe>`;
+  fpvOn = true;
+  const btn = document.getElementById("fpvBtn");
+  btn.textContent = "关闭画面"; btn.classList.add("on");
+}
 function toggleLeft(){
   const mid = document.getElementById("mid");
   const collapsed = mid.classList.toggle("collapsed");
@@ -311,11 +327,16 @@ async function poll(){
     big.textContent = "⚠ 异常，请稍候"; big.style.color="var(--red)";
   } else if(Object.values(st).every(v=>v==="running")){
     big.textContent = "● 就绪"; big.style.color="var(--green)";
+    if(!lastAllRunning){
+      lastAllRunning = true;
+      remountFpv();      // 服务这时才真的能连上，重挂 iframe
+    }
   } else if(Object.values(st).some(v=>v==="starting")){
     big.textContent = "○ 连接中…"; big.style.color="var(--amber)";
   } else {
     big.textContent = "未启动"; big.style.color="var(--muted)";
   }
+  if(!Object.values(st).every(v=>v==="running")) lastAllRunning = false;
   // 日志：内容更新后按需自动滚到底（看最新）
   const box = document.getElementById("logbox");
   const txt = (s.logs[curTab]||[]).join("\n");

@@ -44,10 +44,11 @@ HINTS = {
 
 class FunnelDecision:
     __slots__ = ("send", "best", "reason", "hint", "timings",
-                 "frames", "best_index", "af_triggered", "af_ok")
+                 "frames", "best_index", "af_triggered", "af_ok", "seg")
 
     def __init__(self, send, best, reason, hint, timings,
-                 frames=None, best_index=-1, af_triggered=False, af_ok=None):
+                 frames=None, best_index=-1, af_triggered=False, af_ok=None,
+                 seg=None):
         self.send = send
         self.best = best
         self.reason = reason
@@ -57,6 +58,10 @@ class FunnelDecision:
         self.best_index = best_index     # best 在簇里的下标
         self.af_triggered = af_triggered # 本轮有没有触发 AF
         self.af_ok = af_ok               # AF /reg 请求是否返回成功（None=没触发）
+        # 段级判据实测值 {stable, flow, worst, content, light}。
+        # 阈值（SEVERE_FLOW 等）至今没用样本正式标定，把每次的真实数值带出来，
+        # 才能从实跑日志里看出该往哪调，而不是凭体感来回试。
+        self.seg = seg or {}
 
 
 class FunnelGate:
@@ -177,7 +182,8 @@ class FunnelGate:
             bi = frames.index(best) if (best in frames) else -1
             return FunnelDecision(send, best, reason, hint, timings,
                                   frames=frames, best_index=bi,
-                                  af_triggered=af_triggered, af_ok=af_ok)
+                                  af_triggered=af_triggered, af_ok=af_ok,
+                                  seg=getattr(res, "components", None))
 
         # 4) 拒绝出口
         if not res.accepted:
