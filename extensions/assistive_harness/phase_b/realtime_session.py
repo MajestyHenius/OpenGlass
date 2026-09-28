@@ -62,8 +62,41 @@ from .rokid_runtime import (
 class RealtimeDuplexSession(GatewayDuplexSession):
     """V2 /v1/realtime 协议版的 duplex 会话。构造签名与父类完全一致。"""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._server_closed = asyncio.Event()
+        self._init_sent = False
+        self._backend_session_id = None
+        self._cleanup_confirmed = False
+        self._stop_lock = asyncio.Lock()
+        self._sender = None
+        self.close_uncertain = False
+
+    async def _send_json(self, payload: dict[str, Any]) -> None:
+        # 与 session.close 共用锁；即使发送者已经在等锁，也不能越过关闭边界。
+        async with self._send_lock:
+            if self._closing and payload.get("type") != "session.close":
+                return
+            if self.ws is None or self.ws.closed:
+                raise RuntimeError("gateway session is not connected")
+            if payload.get("type") == "session.init":
+                self._init_sent = True
+            await self.ws.send_json(payload)
+
+    async def start(self) -> None:
+        try:
+            await super().start()
+        except (Exception, asyncio.CancelledError):
+            # wait_for(shield(_ready)) 超时不会停止 _run，必须在重试前收回它。
+            try:
+                await self.stop("startup_failed")
+            except Exception as exc:
+                LOG.warning("[GW-LIFECYCLE] startup cleanup: %s", exc)
+            raise
+
     # ------------------------------------------------------------ 连接
     async def _run(self) -> None:
+        io_tasks = []
         scheme = "wss" if self.config.gateway_tls else "ws"
         # mode=video：连续音频 + 可带视频帧，300s 上限。
         # mode=audio 是纯音频（600s），我们要送图所以用 video。
@@ -81,13 +114,26 @@ class RealtimeDuplexSession(GatewayDuplexSession):
                 ) as ws:
                     self.ws = ws
                     await self._prepare(ws)
-                    self.status = "running"
-                    if self._ready is not None and not self._ready.done():
-                        self._ready.set_result(None)
-                    await asyncio.gather(
-                        self._send_loop(ws),
-                        self._receive_loop(ws),
-                    )
+                    if not self._closing:
+                        self.status = "running"
+                        if self._ready is not None and not self._ready.done():
+                            self._ready.set_result(None)
+                    self._sender = asyncio.create_task(self._send_loop(ws))
+                    receiver = asyncio.create_task(self._receive_loop(ws))
+                    io_tasks = [self._sender, receiver]
+                    try:
+                        done, _ = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            if not task.cancelled():
+                                task.result()
+                        # stop() 先停止上行，接收者必须继续读关闭确认。
+                        if self._closing and not receiver.done():
+                            await receiver
+                    finally:
+                        for task in io_tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*io_tasks, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -97,6 +143,8 @@ class RealtimeDuplexSession(GatewayDuplexSession):
             if self._ready is not None and not self._ready.done():
                 self._ready.set_exception(exc)
         finally:
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(RuntimeError("gateway closed before session ready"))
             self._stopped.set()
             if self.status not in ("failed",):
                 self.status = "closed"
@@ -117,6 +165,9 @@ class RealtimeDuplexSession(GatewayDuplexSession):
                 continue
             payload = json.loads(message.data)
             mtype = payload.get("type")
+            if mtype == "session.closed":
+                self._server_closed.set()
+                raise RuntimeError("gateway session closed while queued")
             if mtype == "session.queue_done":
                 break
             if mtype == "error":
@@ -153,11 +204,15 @@ class RealtimeDuplexSession(GatewayDuplexSession):
                 continue
             payload = json.loads(message.data)
             mtype = payload.get("type")
+            if mtype == "session.closed":
+                self._server_closed.set()
+                raise RuntimeError("gateway session closed while preparing")
             if mtype == "session.created":
                 # session_id 由服务端给，覆盖本地占位的那个
                 sid = payload.get("session_id")
                 if sid:
                     self.session_id = sid
+                    self._backend_session_id = sid
                 LOG.info("[GW] prepared session=%s generation=%d skill=%s mode=%s",
                          self.session_id, self.spec.generation,
                          self.spec.skill_id, payload.get("mode"))
@@ -181,6 +236,8 @@ class RealtimeDuplexSession(GatewayDuplexSession):
         sent = 0
         while not self._closing:
             audio = await self._next_audio_chunk(carry)
+            if self._closing:
+                break
             if audio is None:
                 continue
             inp: dict[str, Any] = {
@@ -216,14 +273,20 @@ class RealtimeDuplexSession(GatewayDuplexSession):
         """
         cur_turn = None
         async for message in ws:
-            if self._closing:
-                break
             if message.type != aiohttp.WSMsgType.TEXT:
                 if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
                 continue
             payload = json.loads(message.data)
             mtype = payload.get("type")
+
+            if mtype == "session.closed":
+                self._server_closed.set()
+                LOG.info("[GW-LIFECYCLE] transport close notification session=%s reason=%s",
+                         self.session_id, payload.get("reason"))
+                break
+            if self._closing:
+                continue  # 丢弃旧输出，但继续等 session.closed。
 
             if mtype == "response.output.delta":
                 kind = payload.get("kind")
@@ -257,10 +320,6 @@ class RealtimeDuplexSession(GatewayDuplexSession):
                 })
                 continue
 
-            if mtype == "session.closed":
-                LOG.info("[GW] session.closed reason=%s", payload.get("reason"))
-                break
-
             if mtype == "error":
                 err = payload.get("error")
                 msg = err.get("message") if isinstance(err, dict) else str(err)
@@ -275,24 +334,65 @@ class RealtimeDuplexSession(GatewayDuplexSession):
                 continue
 
     # ------------------------------------------------------------ 结束
+    async def _close_backend(self, reason: str) -> None:
+        # Unlike the early WS notification, this HTTP response is emitted only
+        # after the backend's cleanup mutex is released and the session removed.
+        from urllib.parse import quote
+        sid = self._backend_session_id
+        if not sid:
+            raise RuntimeError("backend session ID unavailable; cannot confirm cleanup")
+        url = f"{self.config.backend_close_url.rstrip('/')}/sessions/{quote(sid, safe='')}/close"
+        timeout = aiohttp.ClientTimeout(total=self.config.close_timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as client:
+            async with client.post(url, json={"reason": reason}) as response:
+                response.raise_for_status()
+                result = await response.json()
+                if (result.get("ok") is not True or result.get("closed") is not True
+                        or result.get("session_id") != sid):
+                    raise RuntimeError("backend did not confirm completed session cleanup")
+        self._cleanup_confirmed = True
+        LOG.info("[GW-LIFECYCLE] cleanup completed session=%s (backend HTTP)", sid)
+
     async def stop(self, cleanup_mode: str) -> None:
-        self._closing = True
-        if self.ws is not None and not self.ws.closed:
+        async with self._stop_lock:
+            first_close = not self._closing
+            self._closing = True
             try:
-                await self._send_json({"type": "session.close",
-                                       "reason": cleanup_mode or "user_stop"})
-            except Exception:
-                pass
-        try:
-            await asyncio.wait_for(self._stopped.wait(),
-                                   timeout=self.config.close_timeout_s)
-        except asyncio.TimeoutError:
-            pass
-        if self.ws is not None and not self.ws.closed:
-            await self.ws.close()
-        if self._task and not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
+                if self._sender and not self._sender.done():
+                    self._sender.cancel()
+                    await asyncio.gather(self._sender, return_exceptions=True)
+                if self._init_sent and first_close and self.config.backend_close_url:
+                    LOG.info("[GW-LIFECYCLE] waiting for backend cleanup session=%s", self.session_id)
+                    # Do not also send session.close through worker: that would
+                    # submit a second concurrent HTTP close for the same session.
+                    await self._close_backend(cleanup_mode or "user_stop")
+                elif self._init_sent and first_close and self.ws is not None and not self.ws.closed:
+                    LOG.info("[GW-LIFECYCLE] close requested session=%s generation=%d",
+                             self.session_id, self.spec.generation)
+                    await asyncio.wait_for(
+                        self._send_json({"type": "session.close",
+                                         "reason": cleanup_mode or "user_stop"}),
+                        timeout=self.config.close_timeout_s)
+                if self._init_sent and self._task and not self._task.done():
+                    await asyncio.wait_for(self._stopped.wait(),
+                                           timeout=self.config.close_timeout_s)
+            except Exception as exc:
+                LOG.warning("[GW-LIFECYCLE] close incomplete session=%s: %r", self.session_id, exc)
+            finally:
+                # 排队尚未 init 时无需 close 消息；断开即可撤销排队。所有路径都回收任务。
+                if self._task and not self._task.done():
+                    self._task.cancel()
+                    await asyncio.gather(self._task, return_exceptions=True)
+                if self.ws is not None and not self.ws.closed:
+                    await self.ws.close()
+                self.close_uncertain = self._init_sent and not self._cleanup_confirmed
+                if self.close_uncertain:
+                    LOG.error("[GW-LIFECYCLE] close_unconfirmed session=%s; automatic replacement blocked",
+                              self.session_id)
+            if self.close_uncertain:
+                self.last_error = "后端清理完成未获确认，已停止自动重建；请全部停止后重新启动"
+                LOG.error("[GW-LIFECYCLE] %s session=%s", self.last_error, self.session_id)
+                raise RuntimeError(self.last_error)
 
     # ------------------------------------------------------------ 文本注入
     async def inject_task(self, text: str) -> bool:

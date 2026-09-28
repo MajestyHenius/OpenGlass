@@ -52,16 +52,51 @@ Pick a device and prompt, click **Start**, wait for four green indicators, and t
 
 ## Panel controls
 
+ESP32 modes: ① basic conversation; ② adds Harness voice controls without image
+filtering; ③ selects the best frame but sends it even if quality checks reject it;
+④ selects frames and silently withholds rejected images. Mode ④ keeps voice
+controls enabled, logs rejection reasons, and does not automatically pause the
+conversation or play rejection hints. It no longer requires rejection WAV files.
+The standalone runtime still supports `--force-measure` for explicit experiments;
+the panel does not enable it. Image filtering cannot guarantee hallucination-free
+responses: previous image context remains available to the model.
+
 | Control | Behavior |
 | --- | --- |
 | **Start (一键启动)** | Starts `llama-omni-server` → `worker` → `gateway` → `demo` in order, waiting for each to be ready. Uses the prompt currently shown in the panel. |
 | **Stop (停止)** | Gracefully stops only the bridge (so the session flushes to disk); backend/worker/gateway stay warm. |
 | **Start again** | After Stop, brings the bridge back up quickly (front stages still running). |
-| **Stop All (全部停止)** | Stops bridge → gateway → worker → llama-omni-server. |
+| **Stop All (全部停止)** | Stops the bridge, harness (if used), gateway, worker, and llama backend; verifies owned child processes have exited and service ports are released. |
 | **Chain dropdown** | Switches between the **ESP32** and **Rokid** links; the front three stages are shared, only the fourth process differs. Rokid hides the device dropdown (the APK connects inbound). |
 | **Close window** | Runs Stop All. |
 
 The panel refuses to adopt a process that already occupies a target port but wasn't started by the panel, so it won't kill a service you launched by hand.
+
+On Windows each launched service is assigned to a Job Object. Stop All and window
+close allow the bridge up to 120 seconds to finish recordings, then forcibly end
+remaining owned processes and descendants. The OS also ends assigned processes
+if the panel exits abruptly (recording files may then be incomplete). A failed
+cleanup is logged and blocks restarting; the panel reports completion only after
+its process groups are empty and the checked service ports are free.
+
+For the Phase B realtime client, the panel passes `--backend-close-url` using the
+llama health endpoint's origin. Skill switches stop sending input and await
+`POST /sessions/{session_id}/close` with a matching successful completion response
+before creating the next session. The early WebSocket `session.closed` message
+alone is insufficient. A timeout or invalid response blocks automatic reuse and
+requires Stop All. When launching `esp32_runtime` manually against this backend,
+include `--backend-close-url http://127.0.0.1:22500` (adjust for your backend).
+This uses the existing backend HTTP interface; it does not modify model code.
+
+Control latency diagnostics: Harness logs include millisecond timestamps and
+`asr` / `event` IDs. Follow `recognized → decided → send` in the Harness log and
+`received → start → playback_blocked → done` in the runtime log. Harness also
+receives a completion summary and writes the per-stage durations to its run's
+`metrics.csv` and `session_events.jsonl`. `execution_ms` uses a monotonic clock;
+cross-process durations assume the services share the PC clock. `playback_blocked`
+means the software playback queue was blocked and flushed, not a measurement of
+the last audible sample. Failed/ignored/cancelled operations are labeled separately.
+The panel refreshes every 250 ms, with at most one status request in flight.
 
 ## Configuration
 

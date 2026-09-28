@@ -1,107 +1,237 @@
 from __future__ import annotations
 
+import ast
+import copy
 import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from runtime.openglass_omni.config import load_devices, load_prompts, load_runtime_config
-from runtime.openglass_omni.panel import ProcessManager, preflight
+
+# Import only the current manager/config: importing panel itself creates local
+# certificates and reads machine-specific secrets. Neither belongs in a test.
+SOURCE = Path(__file__).resolve().parents[1] / "runtime/openglass_omni/panel.py"
+TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
+NODES = [node for node in TREE.body if
+    isinstance(node, ast.ClassDef) and node.name == "ProcManager" or
+    isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CONFIG" for t in node.targets)]
+NAMESPACE = dict(globals(), __file__=str(SOURCE))
+exec(compile(ast.Module(body=NODES, type_ignores=[]), str(SOURCE), "exec"), NAMESPACE)
+ProcManager = NAMESPACE["ProcManager"]
 
 
-class OmniPanelIntegrationTests(unittest.TestCase):
-    def setUp(self) -> None:
+class PanelLifecycleTests(unittest.TestCase):
+    def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.minicpm = self.root / "MiniCPM-o-Demo"
-        self.llama = self.root / "llama.cpp-omni"
-        self.model_dir = self.root / "models"
-        self.minicpm.mkdir()
-        self.model_dir.mkdir()
-        (self.llama / "build" / "bin").mkdir(parents=True)
-        (self.minicpm / "certs").mkdir()
-        for filename in ("worker.py", "gateway.py", "config.py"):
-            (self.minicpm / filename).write_text("# test fixture\n", encoding="utf-8")
-        (self.llama / "build" / "bin" / "llama-server.exe").write_bytes(b"fixture")
-        (self.model_dir / "model.gguf").write_bytes(b"fixture")
-        (self.minicpm / "certs" / "cert.pem").write_text("fixture", encoding="utf-8")
-        (self.minicpm / "certs" / "key.pem").write_text("fixture", encoding="utf-8")
-        self._write_json(
-            self.minicpm / "config.json",
-            {
-                "backend": "cpp",
-                "service": {"gateway_port": 8040, "worker_base_port": 22440},
-                "cpp_backend": {
-                    "llamacpp_root": str(self.llama),
-                    "model_dir": str(self.model_dir),
-                    "llm_model": "model.gguf",
-                },
-            },
-        )
-        self.devices = self.root / "devices.local.json"
-        self.prompts = self.root / "prompts.json"
-        self._write_json(
-            self.devices,
-            {"devices": [{"name": "Test Glasses", "esp32_host": "192.0.2.10", "esp32_port": 80}]},
-        )
-        self._write_json(self.prompts, {"prompts": {"General": "Answer only from current input."}})
-        self.config_path = self.root / "runtime.local.json"
-        self._write_json(
-            self.config_path,
-            {
-                "minicpm_demo_root": str(self.minicpm),
-                "llama_cpp_omni_root": str(self.llama),
-                "devices_file": str(self.devices),
-                "prompts_file": str(self.prompts),
-                "state_dir": str(self.root / "state"),
-                "worker": {"host": "127.0.0.1", "port": 22440},
-                "gateway": {
-                    "host": "127.0.0.1",
-                    "bind_host": "0.0.0.0",
-                    "port": 8040,
-                    "tls": True,
-                },
-                "demo": {"ui_host": "127.0.0.1", "ui_port": 8080},
-            },
-        )
+        cfg = copy.deepcopy(NAMESPACE["CONFIG"])
+        cfg["proc_log_dir"] = self.temp.name
+        cfg["llama_ready_timeout_s"] = 0.005
+        with patch.object(threading.Thread, "start"):
+            self.manager = ProcManager(cfg)
+        self.manager.current_chain = "esp32_full"
+        self.manager._sleep = Mock(return_value=True)
 
-    def tearDown(self) -> None:
+    def tearDown(self):
         self.temp.cleanup()
 
-    @staticmethod
-    def _write_json(path: Path, data: object) -> None:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    def alive(self, name):
+        self.manager.procs[name] = SimpleNamespace(pid=123, poll=lambda: None)
 
-    def test_preflight_accepts_external_upstreams_and_existing_binary(self) -> None:
-        cfg = load_runtime_config(self.config_path)
-        findings = preflight(cfg)
-        self.assertFalse([item for item in findings if item["level"] == "error"])
-        self.assertTrue(any("Existing llama.cpp-omni build" in item["message"] for item in findings))
+    def test_worker_log_does_not_override_failed_health(self):
+        m = self.manager
+        m._ready_events["worker"].set()
+        m._http_get_json = Mock(return_value={"status": "error"})
+        self.assertFalse(m._probe_ready("worker")[0])
 
-    def test_process_commands_keep_upstream_and_openglass_workdirs_separate(self) -> None:
-        cfg = load_runtime_config(self.config_path)
-        manager = ProcessManager(cfg, load_prompts(self.prompts), load_devices(self.devices))
+    def test_exited_parent_still_cleans_owned_job(self):
+        m = self.manager
+        m.procs["worker"] = SimpleNamespace(poll=lambda: 0)
+        job = Mock()
+        m._jobs["worker"] = job
+        self.assertTrue(m._kill("worker"))
+        job.finish.assert_called_once()
+        self.assertNotIn("worker", m._jobs)
+
+    def test_failed_job_cleanup_does_not_report_stopped(self):
+        m = self.manager
+        m.procs["worker"] = SimpleNamespace(poll=lambda: 0)
+        job = Mock()
+        job.finish.side_effect = TimeoutError("child remains")
+        m._jobs["worker"] = job
+        self.assertFalse(m._kill("worker"))
+        self.assertEqual(m.status["worker"], "crashed")
+        self.assertIn("worker", m._jobs)
+
+    def test_start_rejected_after_panel_shutdown(self):
+        self.manager._shutting_down = True
+        self.assertFalse(self.manager.start_all())
+        self.assertFalse(self.manager._op_lock.locked())
+
+    def test_panel_passes_actual_backend_url_to_runtime(self):
+        m = self.manager
+        m.cfg["llama_health_url"] = "http://127.0.0.1:22509/health"
+        m._device_args = Mock(return_value=[])
+        m._funnel_extra_args = Mock(return_value=[])
+        cmd = m._build_cmd("demo_funnel")
+        self.assertEqual(cmd[cmd.index("--backend-close-url") + 1], "http://127.0.0.1:22509")
+
+    def test_stop_all_reports_incomplete_until_job_is_empty(self):
+        m = self.manager
+        job = Mock()
+        job.finish.side_effect = TimeoutError("child remains")
+        m._jobs["worker"] = job
+        m._port_open = Mock(return_value=False)
+        with patch.object(time, "sleep"):
+            self.assertFalse(m._stop_all_sync())
+        self.assertTrue(m._backend_recovery_required)
+        self.assertEqual(m.status["worker"], "crashed")
+        job.finish.side_effect = None
+        with patch.object(time, "sleep"):
+            self.assertTrue(m._stop_all_sync())
+        self.assertFalse(m._backend_recovery_required)
+
+    def test_gateway_defaults_to_probed_ipv4_worker(self):
+        m = self.manager
+        m.cfg["worker_health_port"] = 22409
+        cmd = m._build_cmd("gateway")
+        self.assertEqual(cmd[cmd.index("--workers") + 1], "127.0.0.1:22409")
+
+    def test_panel_modes_keep_voice_and_silent_filtering_distinct(self):
+        m = self.manager
+        m.current_chain = "esp32_voice"
+        self.assertEqual(m._funnel_extra_args(), [])
+        m.current_chain = "esp32_select"
+        self.assertIn("--no-reject", m._funnel_extra_args())
+        m.current_chain = "esp32_full"
+        args = m._funnel_extra_args()
+        self.assertIn("--funnel", args)
+        self.assertNotIn("--no-reject", args)
+        self.assertNotIn("--force-measure", args)
+        self.assertNotIn("--reject-wav-dir", args)
+        m._reject_wav_dir = Mock(side_effect=AssertionError("silent mode must not require hint audio"))
+        self.assertTrue(m._check_reject_wav())
+
+    def test_gateway_preserves_explicit_worker_options(self):
+        m = self.manager
+        for args in (["--workers", "host:1234"], ["--workers=host:1234"],
+                     ["--num-workers", "2"], ["--num-workers=2"]):
+            m.cfg["procs"]["gateway"] = ["python", "gateway.py", *args]
+            self.assertEqual(m._build_cmd("gateway")[2:], args)
+
+    def test_child_proxy_bypass_preserves_existing_settings(self):
+        with patch.object(os, "environ", {"HTTP_PROXY": "http://proxy:1234",
+                                    "NO_PROXY": "internal.example",
+                                    "no_proxy": "other.example"}):
+            env = self.manager._child_env()
+            self.assertEqual(env["HTTP_PROXY"], "http://proxy:1234")
+            self.assertEqual(env["NO_PROXY"], env["no_proxy"])
+            for host in ("localhost", "127.0.0.1", "::1", "internal.example", "other.example"):
+                self.assertIn(host, env["NO_PROXY"].split(","))
+            self.assertEqual(os.environ["NO_PROXY"], "internal.example")
+
+    def test_gateway_with_only_offline_workers_is_not_ready(self):
+        m = self.manager
+        m._gateway_status = Mock(return_value={"gateway_healthy": True, "offline_workers": 1})
+        self.assertFalse(m._probe_ready("gateway")[0])
+        m._gateway_status.return_value = {"gateway_healthy": True, "idle_workers": 1}
+        self.assertTrue(m._probe_ready("gateway")[0])
+
+    def test_harness_requires_loaded_asr(self):
+        m = self.manager
+        m._http_get_json = Mock(return_value={"ok": True, "enabled": True, "asr_loaded": False})
+        self.assertFalse(m._probe_ready("harness")[0])
+
+    def test_alive_backend_does_not_pass_readiness_timeout(self):
+        m = self.manager
+        self.alive("llama")
+        m._http_ok = Mock(return_value=False)
+        self.assertFalse(m._wait_ready_or_die("llama", 0.005))
+
+    def test_tail_requires_actual_session_ready(self):
+        m = self.manager
+        self.alive("demo_funnel")
+        self.assertFalse(m._probe_ready("demo_funnel")[0])
+        m._ready_events["demo_funnel"].set()
+        self.assertTrue(m._probe_ready("demo_funnel")[0])
+
+    def test_unknown_port_owner_blocks_launch_without_killing(self):
+        m = self.manager
+        m._port_open = Mock(side_effect=lambda port: port == 22500)
+        m._kill_by_port = Mock()
+        self.assertFalse(m._sweep_stale())
+        m._kill_by_port.assert_not_called()
+
+    def test_own_funnel_ui_is_not_treated_as_stale(self):
+        m = self.manager
+        self.alive("demo_funnel")
+        m._port_open = Mock(side_effect=lambda port: port == 8080)
+        self.assertTrue(m._sweep_stale())
+
+    def test_failed_upstream_recheck_prevents_client_start(self):
+        m = self.manager
+        for stage in ("llama", "worker", "gateway", "harness"):
+            self.alive(stage)
+        m._sweep_stale = Mock(return_value=True)
+        m._check_extensions = m._check_deps = m._check_reject_wav = Mock(return_value=True)
+        m._wait_ready_or_die = Mock(side_effect=lambda name, timeout: name != "worker")
+        m._start_one = Mock(return_value=True)
+        m._do_start_all()
+        m._start_one.assert_not_called()
+        self.assertEqual(m.status["worker"], "crashed")
+
+    def test_missing_backend_stops_downstream_before_start(self):
+        m = self.manager
+        for stage in ("worker", "gateway", "harness", "demo_funnel"):
+            self.alive(stage)
+        m._sweep_stale = Mock(return_value=True)
+        m._check_extensions = m._check_deps = m._check_reject_wav = Mock(return_value=True)
+        calls = []
+        def kill(name, **kwargs):
+            calls.append(("stop", name))
+            m.procs.pop(name, None)
+            return True
+        def start(name):
+            calls.append(("start", name))
+            self.alive(name)
+            return True
+        m._kill, m._start_one = kill, start
+        m._do_start_all()
+        self.assertLess(calls.index(("stop", "worker")), calls.index(("start", "llama")))
+        self.assertLess(calls.index(("stop", "demo_funnel")), calls.index(("start", "llama")))
+
+    def test_configuration_does_not_change_during_launch(self):
+        m = self.manager
+        m._op_lock.acquire()
         try:
-            worker_cmd, worker_cwd = manager._build_command("worker")
-            gateway_cmd, gateway_cwd = manager._build_command("gateway")
-            demo_cmd, demo_cwd = manager._build_command("demo")
+            self.assertFalse(m.configure(chain="esp32_voice", prompt="changed"))
+            self.assertEqual(m.current_chain, "esp32_full")
         finally:
-            manager.shutdown()
+            m._op_lock.release()
 
-        self.assertEqual(worker_cwd, self.minicpm)
-        self.assertEqual(gateway_cwd, self.minicpm)
-        self.assertEqual(demo_cwd, self.root / "state")
-        self.assertIn(str(self.minicpm / "worker.py"), worker_cmd)
-        self.assertIn(str(self.minicpm / "gateway.py"), gateway_cmd)
-        self.assertTrue(any(value.endswith("esp32_bridge.py") for value in demo_cmd))
-        self.assertIn(str(self.devices), demo_cmd)
+    def test_restart_uses_normal_startup_checks(self):
+        m = self.manager
+        m._kill = Mock(return_value=True)
+        m._do_start_all = Mock()
+        with patch.object(threading, "Thread", side_effect=lambda target, **kw: SimpleNamespace(start=target)):
+            self.assertTrue(m.restart_demo("test"))
+        m._do_start_all.assert_called_once()
+        self.assertFalse(m._op_lock.locked())
 
-    def test_preflight_rejects_mismatched_llama_checkout(self) -> None:
-        cfg = load_runtime_config(self.config_path)
-        cfg["llama_cpp_omni_root"] = self.root / "different-llama"
-        findings = preflight(cfg)
-        errors = [item["message"] for item in findings if item["level"] == "error"]
-        self.assertTrue(any("different llama.cpp-omni checkouts" in message for message in errors))
+    def test_lifecycle_diagnostics_are_persisted(self):
+        m = self.manager
+        m._log("llama", "exit=3221225477 hex=0xC0000005")
+        self.assertIn("0xC0000005", Path(m._panel_log_path).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

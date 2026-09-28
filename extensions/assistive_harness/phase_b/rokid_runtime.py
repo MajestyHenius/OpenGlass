@@ -439,7 +439,8 @@ class RokidRuntimeConfig:
     image_resend_s: float = 0.5
     image_max_age_s: float = 30.0
     prepare_timeout_s: float = 120.0
-    close_timeout_s: float = 2.0
+    close_timeout_s: float = 10.0
+    backend_close_url: str = ""
     reconnect_s: float = 1.5
     play_audio: bool = True
     session_ready_chime: bool = True
@@ -797,7 +798,10 @@ class GatewaySessionManager:
         self.harness: SessionTelemetry | None = None
         self.active: GatewayDuplexSession | None = None
         self._restart_lock = asyncio.Lock()
+        self._lifecycle_error = ""
+        self._closing = False
         self._playback_epoch = 0
+        self._background_controls: set[asyncio.Task] = set()
         self._playback_release_task: asyncio.Task[None] | None = None
 
     async def send_telemetry(self, payload: dict[str, Any]) -> None:
@@ -860,6 +864,8 @@ class GatewaySessionManager:
 
     async def start_initial(self) -> None:
         async with self._restart_lock:
+            if self._closing or self._lifecycle_error:
+                raise RuntimeError(self._lifecycle_error or "runtime is closing")
             if self.active is not None:
                 return
             spec = self._make_spec(self.registry.default_skill, {})
@@ -874,7 +880,11 @@ class GatewaySessionManager:
             self.active = session
             try:
                 await session.start()
-            except Exception:
+            except (Exception, asyncio.CancelledError):
+                try:
+                    await session.stop(self.config.cleanup_mode)
+                except Exception as exc:
+                    self._lifecycle_error = str(exc)
                 self.active = None
                 raise
             await self._emit_bound()
@@ -892,7 +902,7 @@ class GatewaySessionManager:
         )
 
     async def emit_recovery_sync(self) -> None:
-        if self.active is None:
+        if self.active is None or self.active.status != "running" or self.gate.restart_in_progress:
             return
         await self.send_telemetry(
             {
@@ -908,6 +918,64 @@ class GatewaySessionManager:
         await self._emit_bound()
 
     async def handle_control(self, event: dict[str, Any]) -> dict[str, Any]:
+        event = dict(event)
+        started = time.monotonic()
+        event['_control_started_mono'] = started
+        event['control_started_at_ms'] = now_ms()
+        LOG.info("[CONTROL] stage=start asr=%s event=%s intent=%s",
+                 event.get('asr_event_id'), event.get('event_id'), event.get('intent'))
+        result = {}
+        outcome = "error"
+        try:
+            result = await self._handle_control(event)
+            outcome = "ignored" if result.get("ignored") else "completed" if result.get("ok") else "failed"
+            return result
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            done = now_ms()
+            timing = {
+                "type": "control.timing", "event_id": event.get("event_id"),
+                "asr_event_id": event.get("asr_event_id"), "intent": event.get("intent"),
+                "ok": bool(result.get("ok")), "outcome": outcome,
+                "execution_ms": round((time.monotonic() - started) * 1000, 3),
+                "control_done_at_ms": done,
+            }
+            for key in ("asr_final_at_ms", "control_sent_at_ms", "control_received_at_ms", "control_started_at_ms"):
+                if key in event:
+                    timing[key] = event[key]
+            for metric, end, begin in (
+                ("asr_to_send_ms", "control_sent_at_ms", "asr_final_at_ms"),
+                ("send_to_receive_ms", "control_received_at_ms", "control_sent_at_ms"),
+                ("receive_to_start_ms", "control_started_at_ms", "control_received_at_ms"),
+                ("asr_to_done_ms", "control_done_at_ms", "asr_final_at_ms"),
+            ):
+                if end in timing and begin in timing:
+                    timing[metric] = round(timing[end] - timing[begin], 3)
+            if "start_to_playback_blocked_ms" in event:
+                timing["start_to_playback_blocked_ms"] = event["start_to_playback_blocked_ms"]
+            LOG.info("[CONTROL] stage=done asr=%s event=%s outcome=%s execution_ms=%.3f",
+                     event.get('asr_event_id'), event.get('event_id'), outcome, timing['execution_ms'])
+            try:
+                await self.send_telemetry(timing)
+            except Exception:
+                LOG.warning("[CONTROL] timing telemetry unavailable event=%s", event.get('event_id'))
+
+    async def _handle_control(self, event: dict[str, Any]) -> dict[str, Any]:
+        if self._closing or self._lifecycle_error:
+            ack = {**self._ack_base(event), "ok": False,
+                   "error": self._lifecycle_error or "runtime is closing"}
+            await self.send_telemetry(ack)
+            return ack
+        if event.get("source") == "funnel" and (
+            self.gate.restart_in_progress
+            or event.get("generation", self.gate.generation) != self.gate.generation
+        ):
+            ack = {**self._ack_base(event), "ok": False, "ignored": True,
+                   "reason": "stale_funnel_or_restart_in_progress"}
+            await self.send_telemetry(ack)
+            return ack
         if not event.get("accepted"):
             return {"ok": False, "ignored": True}
         intent = str(event.get("intent") or "")
@@ -939,6 +1007,11 @@ class GatewaySessionManager:
     ) -> dict[str, Any]:
         self.gate.stop()
         await self.speaker.block_and_flush()
+        if "_control_started_mono" in event:
+            event["start_to_playback_blocked_ms"] = round(
+                (time.monotonic() - event["_control_started_mono"]) * 1000, 3)
+            LOG.info("[CONTROL] stage=playback_blocked asr=%s event=%s elapsed_ms=%.3f",
+                     event.get('asr_event_id'), event.get('event_id'), event['start_to_playback_blocked_ms'])
         await self._clear_playback_state("stop")
         ack = {**self._ack_base(event), "ok": True}
         if emit_ack:
@@ -947,6 +1020,11 @@ class GatewaySessionManager:
         return ack
 
     async def resume_speech(self, event: dict[str, Any]) -> dict[str, Any]:
+        if self.gate.restart_in_progress:
+            ack = {**self._ack_base(event), "ok": False, "ignored": True,
+                   "reason": "restart_in_progress"}
+            await self.send_telemetry(ack)
+            return ack
         self.gate.resume()
         await self.speaker.resume()
         ack = {**self._ack_base(event), "ok": True}
@@ -956,6 +1034,11 @@ class GatewaySessionManager:
 
     async def restart(self, event: dict[str, Any]) -> dict[str, Any]:
         async with self._restart_lock:
+            if self._closing or self._lifecycle_error:
+                ack = {**self._ack_base(event), "ok": False,
+                       "error": self._lifecycle_error or "runtime is closing"}
+                await self.send_telemetry(ack)
+                return ack
             requested_skill = str(event.get("skill_id") or self.registry.default_skill)
             requested_slots = dict(event.get("slots") or {})
             if (
@@ -968,8 +1051,8 @@ class GatewaySessionManager:
                 return ack
 
             started = time.monotonic()
-            await self.stop_speech(event, emit_ack=False)
             self.gate.restart_in_progress = True
+            await self.stop_speech(event, emit_ack=False)
             old_session = self.active
             old_session_id = old_session.session_id if old_session else None
             self.gate.generation += 1
@@ -985,7 +1068,11 @@ class GatewaySessionManager:
             self.active = None
             try:
                 if old_session:
-                    await old_session.stop(self.config.cleanup_mode)
+                    try:
+                        await old_session.stop(self.config.cleanup_mode)
+                    except Exception as exc:
+                        self._lifecycle_error = str(exc)
+                        raise
                 self.audio_queue.clear()
                 spec = self._make_spec(
                     requested_skill,
@@ -1082,11 +1169,16 @@ class GatewaySessionManager:
                     latency_ms,
                 )
                 return ack
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 if self.active:
-                    await self.active.stop(self.config.cleanup_mode)
+                    try:
+                        await self.active.stop(self.config.cleanup_mode)
+                    except Exception as cleanup_exc:
+                        self._lifecycle_error = str(cleanup_exc)
                 self.active = None
                 self.gate.restart_in_progress = False
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
                 ack = {**self._ack_base(event), "ok": False, "error": str(exc)}
                 await self.send_telemetry(ack)
                 LOG.exception("[CONTROL] restart failed")
@@ -1160,6 +1252,7 @@ class GatewaySessionManager:
             LOG.info("[MODEL] listen=%s text=%s", is_listen, text)
 
     async def close(self) -> None:
+        self._closing = True
         await self._clear_playback_state("close")
         if self.active:
             await self.active.stop(self.config.cleanup_mode)
@@ -1176,7 +1269,7 @@ class GatewaySessionManager:
             "dropped_old_audio": self.gate.dropped_old_audio,
             "session_id": self.active.session_id if self.active else None,
             "gateway_status": self.active.status if self.active else "disconnected",
-            "gateway_error": self.active.last_error if self.active else "",
+            "gateway_error": self._lifecycle_error or (self.active.last_error if self.active else ""),
         }
 
 
@@ -1225,6 +1318,9 @@ class HarnessClient:
                             if message_type == "harness.ready":
                                 await self.manager.emit_recovery_sync()
                             elif message_type == "control.intent":
+                                payload["control_received_at_ms"] = now_ms()
+                                LOG.info("[CONTROL] stage=received asr=%s event=%s",
+                                         payload.get('asr_event_id'), payload.get('event_id'))
                                 task = asyncio.create_task(
                                     self.manager.handle_control(payload)
                                 )
@@ -1382,6 +1478,8 @@ class PhaseBRokidRuntime:
                 raise
             except Exception as exc:
                 LOG.warning("initial Gateway session failed: %s", exc)
+                if self.manager._lifecycle_error or self.manager._closing:
+                    return
                 await asyncio.sleep(self.config.reconnect_s)
 
     async def _stats_loop(self) -> None:
@@ -1394,15 +1492,20 @@ class PhaseBRokidRuntime:
                 and time.monotonic() - self.stats.started_mono >= 10.0
                 and self.stats.audio_packets == 0
                 and self.stats.image_count == 0
+                and self.manager.health()["gateway_status"] == "running"
             ):
                 self._no_input_warning_emitted = True
-                LOG.warning(
-                    "[ROKID][NO_INPUT] no PCM/JPEG has reached this process. "
-                    "After the PC runtime is listening, restart OpenGlass "
-                    "Sensor Mode on the glasses (STOP -> RUN) and verify that "
-                    "the APK targets the PC WLAN address on port %d",
-                    self.config.port,
-                )
+                if hasattr(self, "_esp32_host"):
+                    LOG.warning("[ESP32][NO_INPUT] session ready but no input yet; check device %s",
+                                self._esp32_host)
+                else:
+                    LOG.warning(
+                        "[ROKID][NO_INPUT] no PCM/JPEG has reached this process. "
+                        "After the PC runtime is listening, restart OpenGlass "
+                        "Sensor Mode on the glasses (STOP -> RUN) and verify that "
+                        "the APK targets the PC WLAN address on port %d",
+                        self.config.port,
+                    )
             LOG.info(
                 "[STATS] audio=%.1fpps images=%d(+%d) audio_clients=%d "
                 "queue=%d drops=%d rms=%.4f peak=%.4f harness=%s gateway=%s "
@@ -1435,13 +1538,14 @@ class PhaseBRokidRuntime:
         async with self._close_lock:
             if self._closed:
                 return
+            self.manager._closing = True
             LOG.info("Rokid runtime shutdown started")
 
             async def bounded(label: str, awaitable: Awaitable[None]) -> None:
                 try:
                     await asyncio.wait_for(
                         awaitable,
-                        timeout=max(0.5, self.config.close_timeout_s),
+                        timeout=max(0.5, self.config.close_timeout_s * 2 + 2.0),
                     )
                 except asyncio.TimeoutError:
                     LOG.warning(
@@ -1452,6 +1556,10 @@ class PhaseBRokidRuntime:
                         "Rokid shutdown step failed: %s: %s", label, exc
                     )
 
+            for task in tuple(self.manager._background_controls):
+                task.cancel()
+            await bounded("funnel_controls", asyncio.gather(
+                *self.manager._background_controls, return_exceptions=True))
             await bounded("harness", self.harness.close())
             for task in self._tasks:
                 task.cancel()

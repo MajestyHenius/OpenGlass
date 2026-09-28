@@ -201,7 +201,7 @@ async function init(){
   if(CFG.default_scene) ssel.value = CFG.default_scene;
   applyChain();          // 按链路刷新灯/日志页签/FPV/眼镜+判据下拉可见性
   fpvOn=false; toggleFpv();   // 默认开启第一视角画面
-  setInterval(poll, 1000);
+  setInterval(poll, 250);
 }
 
 // 进程内部名 -> 界面显示名（拿不到就退回内部名）
@@ -312,7 +312,11 @@ function switchTab(t){
 }
 
 const CN = {stopped:"未启动", starting:"启动中", running:"运行中", crashed:"已崩溃"};
+let pollInFlight = false;
 async function poll(){
+  if(pollInFlight) return;
+  pollInFlight = true;
+  try {
   const s = await window.pywebview.api.poll();
   const procs = s.procs || CFG.chains[curChain].procs;   // 只看当前链路四个进程
   procs.forEach(n=>{
@@ -345,6 +349,11 @@ async function poll(){
     if(document.getElementById("autoscroll").checked){
       box.scrollTop = box.scrollHeight;
     }
+  }
+  } catch(error) {
+    console.warn("Panel status refresh failed", error);
+  } finally {
+    pollInFlight = false;
   }
 }
 window.addEventListener("pywebviewready", init);

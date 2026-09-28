@@ -6,6 +6,7 @@ import base64
 import json
 import time
 import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -158,7 +159,8 @@ class ClientRuntime:
         route = self.router.route(asr_event.utterance)
         echo = self.echo.evaluate(asr_event.utterance, route.intent, at_ms=finished)
         print(
-            "[AssistiveHarness][ASR] "
+            f"{datetime.now().isoformat(sep=' ', timespec='milliseconds')} [AssistiveHarness][ASR] "
+            f"asr={asr_id} stage=recognized "
             f"text={asr_event.utterance!r} intent={route.intent.value} "
             f"echo={'allow' if echo.allow else 'drop'} reason={echo.reason}",
             flush=True,
@@ -187,7 +189,8 @@ class ClientRuntime:
         )
         decision = self.controller.process(event, now_ms=finished)
         print(
-            "[AssistiveHarness][CONTROL] "
+            f"{datetime.now().isoformat(sep=' ', timespec='milliseconds')} [AssistiveHarness][CONTROL] "
+            f"asr={asr_id} stage=decided "
             f"intent={route.intent.value} accepted={decision.accepted} "
             f"action={decision.action} event={control_id}",
             flush=True,
@@ -198,6 +201,8 @@ class ClientRuntime:
             "action": decision.action,
             "decision_reason": decision.reason,
             "client_id": self.client_id,
+            "asr_final_at_ms": finished,
+            "control_decided_at_ms": now_ms(),
         }
         self.telemetry.write("control", payload)
         if route.intent in {
@@ -369,6 +374,15 @@ class AssistiveHarnessService:
                     response = await runtime.outbound.get()
                     if isinstance(response, list):
                         for item in response:
+                            if item.get("type") == "control.intent":
+                                item["control_sent_at_ms"] = now_ms()
+                                print(
+                                    f"{datetime.now().isoformat(sep=' ', timespec='milliseconds')} "
+                                    f"[AssistiveHarness][CONTROL] stage=send "
+                                    f"asr={item.get('asr_event_id')} event={item.get('event_id')} "
+                                    f"asr_to_send_ms={item['control_sent_at_ms'] - item.get('asr_final_at_ms', item['control_sent_at_ms']):.1f}",
+                                    flush=True,
+                                )
                             await websocket.send_json(item)
                     elif response is not None:
                         await websocket.send_json(response)
@@ -425,6 +439,12 @@ class AssistiveHarnessService:
                 device="none",
             )
         if message_type in ("funnel.stop", "funnel.resume"):
+            generation = message.get("generation")
+            state = runtime.controller.state
+            if state.restart_in_progress or (
+                generation is not None and generation != state.session_generation
+            ):
+                return None  # 旧提示音的控制不能影响正在重建或新一代会话。
             # 漏斗 reject/恢复:程序直接触发,不经 ASR/router 文字匹配。
             # 复用 controller.process + STOP_SPEECH/RESUME_SPEECH,和真人「停一下/恢复对话」
             # 走完全相同的下游(设备端收到 control.intent 执行 stop_speech/resume_speech)。
@@ -449,6 +469,8 @@ class AssistiveHarnessService:
                 "source": "funnel",
                 "client_id": runtime.client_id,
             }
+            if generation is not None:
+                payload["generation"] = generation
             runtime.telemetry.write("control", payload)
             print(
                 "[AssistiveHarness][FUNNEL] "
@@ -488,6 +510,25 @@ class AssistiveHarnessService:
                     int(message.get("generation") or 0),
                 )
             return None
+        if message_type == "control.timing":
+            runtime.telemetry.write("session", dict(message))
+            for key in ("asr_to_send_ms", "send_to_receive_ms", "receive_to_start_ms",
+                        "start_to_playback_blocked_ms", "execution_ms", "asr_to_done_ms"):
+                value = message.get(key)
+                if isinstance(value, (int, float)):
+                    runtime.telemetry.metric(key, value, message.get("event_id"))
+            print(
+                f"{datetime.now().isoformat(sep=' ', timespec='milliseconds')} "
+                f"[AssistiveHarness][CONTROL] stage=done "
+                f"asr={message.get('asr_event_id')} event={message.get('event_id')} "
+                f"ok={message.get('ok')} outcome={message.get('outcome')} "
+                f"send_to_receive_ms={message.get('send_to_receive_ms')} "
+                f"receive_to_start_ms={message.get('receive_to_start_ms')} "
+                f"playback_blocked_ms={message.get('start_to_playback_blocked_ms')} "
+                f"execution_ms={message.get('execution_ms')} "
+                f"asr_to_done_ms={message.get('asr_to_done_ms')}", flush=True,
+            )
+            return None
         if message_type == "control.ack":
             if bool(message.get("ok")) and str(message.get("intent") or "") == "stop_speech":
                 # Browser STOP has already flushed/blocked playback. Do not
@@ -498,7 +539,8 @@ class AssistiveHarnessService:
                 runtime.refresh_echo_speaking()
             runtime.telemetry.write("session", dict(message))
             print(
-                "[AssistiveHarness][ACK] "
+                f"{datetime.now().isoformat(sep=' ', timespec='milliseconds')} [AssistiveHarness][ACK] "
+                f"event={message.get('event_id')} "
                 f"intent={message.get('intent')} ok={message.get('ok')} "
                 f"generation={message.get('generation')} "
                 f"session={message.get('old_session_id') or '-'}"

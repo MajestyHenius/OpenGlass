@@ -55,7 +55,7 @@ CONFIG = {
     # 留空则 worker/gateway 会在面板目录找 worker.py（找不到，启动失败）。
     #"minicpm_demo_dir": r"<PATH_TO>\MiniCPM-o-Demo",
     #e.g.
-    "minicpm_demo_dir": r"D:\MiniCPM-o-Demo_0710\MiniCPM-o-Demo",
+    "minicpm_demo_dir": r"<PATH_TO>\MiniCPM-o-Demo",
 
     # 注意：眼镜 IP 不在这里配。固件走 DHCP，IP 会变，统一由 devices.json 管理、
     # 面板顶部下拉选择（见下方 devices）。此处不再放任何眼镜 IP。
@@ -71,7 +71,9 @@ CONFIG = {
 
     # worker 就绪：日志关键字命中 "Uvicorn running on ...:22400" 即放行（见 _ready_pat）。
     "worker_ready_port": 22400,
-    "worker_health_port": None,     # 关键字就绪为主，不用 HTTP health（None=关闭，避免端口配错卡顿）
+    "worker_health_port": 22400,
+    "gateway_status_url": "https://127.0.0.1:8006/status",
+    "harness_health_url": "https://127.0.0.1:8021/health",
     "health_probe_s": 15.0,
     "stable_alive_s": 8.0,
 
@@ -115,10 +117,10 @@ CONFIG = {
         "llama": [
             #r"<PATH_TO>\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
             #e.g.
-            r"D:\New llama\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
+            r"<PATH_TO>\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
             #"-m", r"<PATH_TO>\MiniCPM-o-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             # e.g.
-            "-m", r"C:\SmartGlasses\MiniCPM-o-4-5-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
+            "-m", r"<PATH_TO>\MiniCPM-o-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             "-ngl", "99",
             "--host", "127.0.0.1",
             "--port", "22500",
@@ -180,7 +182,7 @@ CONFIG = {
             "python", "-m", "extensions.assistive_harness.server", "--enabled",
             #"--model-path", r"<PATH_TO>\LocalASRmodel\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
             # e.g.
-            "--model-path", (r"D:\OpenGlass\OmniDeployment\OpenGlass\LocalASRmodel"
+            "--model-path", (r"<PATH_TO>\LocalASRmodel"
                              r"\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"),
             "--port", "8021",
             # 绝对路径：harness 的 cwd 是 OpenGlass 仓库根，而证书由 _ensure_certs
@@ -255,7 +257,7 @@ CONFIG = {
         #   ① 基础对话 = 上面的 "esp32"（esp32_bridge.py，无 harness 无漏斗）
         #   ② 语音控制 = harness 开、漏斗关
         #   ③ 质量筛选 = ② + 每秒多帧里挑最清晰的一张
-        #   ④ 完整防幻觉 = ③ + 坏图直接拦下并语音提示
+        #   ④ 完整防幻觉 = ③ + 坏图拦下，只记日志，不自动暂停或播提示
         #   每档只比上一档多一件事：看到什么说什么 → 能听懂指令 → 图会挑 → 坏图会拦
         #   （没有"只对焦"这一档：对焦后要等 settle 再重抓，1s chunk 时序固定，
         #     对焦后那张未必赶得上这一轮，等于花了时间没用上。）
@@ -570,11 +572,15 @@ class ProcManager:
     def __init__(self, cfg):
         self.cfg = cfg
         self.procs = {}          # name -> Popen
+        self._jobs = {}          # Windows ownership survives an exited parent.
+        self._shutting_down = False
         self.logs = {n: deque(maxlen=400) for n in cfg["procs"]}
         # —— 关键字就绪：命中即放行，不再 poll /health ——
         _wp = cfg.get("worker_ready_port", 22400)
         self._ready_pat = {
             "worker": re.compile(rf"Uvicorn running on http://[\d.]+:{_wp}"),
+            "demo": re.compile(r"\[GW\] session\.created id="),
+            "demo_funnel": re.compile(r"\[GW\] prepared session="),
         }
         self._ready_events = {n: threading.Event() for n in cfg["procs"]}
         self.status = {n: "stopped" for n in cfg["procs"]}  # stopped/starting/running/crashed
@@ -594,6 +600,11 @@ class ProcManager:
         self._cancel = threading.Event()
         # —— 新增：正被主动停止的进程集合，避免轮询把它误判成 crashed ——
         self._stopping = set()
+        self._backend_recovery_required = False
+        self._panel_log_lock = threading.Lock()
+        self._panel_log_path = os.path.join(
+            cfg.get("proc_log_dir", "logs"),
+            f"panel_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.log")
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     # ---- 新增：可被急停打断的睡眠 ----
@@ -628,6 +639,14 @@ class ProcManager:
         import os as _os
         _here = _os.path.dirname(_os.path.abspath(__file__))
         cmd = [x.replace("{here}", _here) if isinstance(x, str) else x for x in cmd]
+        if name == "gateway" and not any(
+            x in ("--workers", "--num-workers") or
+            x.startswith(("--workers=", "--num-workers=")) for x in cmd
+        ):
+            # Match the IPv4 endpoint checked by the panel; the upstream default
+            # localhost can also resolve to ::1 while worker binds IPv4 only.
+            port = self.cfg.get("worker_health_port") or self.cfg.get("worker_ready_port", 22400)
+            cmd += ["--workers", f"127.0.0.1:{port}"]
         # demo 要 prompt + device；rokid bridge 只要 prompt（它没有 device 概念）
         if name == "demo":
             subst = {"{prompt}": self.current_prompt, "{device}": self.current_device}
@@ -647,6 +666,9 @@ class ProcManager:
             cmd = [subst.get(x, x) for x in cmd]
             cmd += self._device_args()
             cmd += self._funnel_extra_args()
+            from urllib.parse import urlsplit
+            backend = urlsplit(self.cfg["llama_health_url"])
+            cmd += ["--backend-close-url", f"{backend.scheme}://{backend.netloc}"]
         elif name == "rokid":
             _loc = self.cfg.get("local", {})
             subst = {
@@ -659,9 +681,17 @@ class ProcManager:
         return self._wrap_conda(cmd)
 
     # ---- 日志 ----
-    def _log(self, name, line):
+    def _log(self, name, line, persist=True):
         ts = time.strftime("%H:%M:%S")
         self.logs[name].append(f"[{ts}] {line.rstrip()}")
+        if persist:
+            try:
+                with self._panel_log_lock:
+                    os.makedirs(os.path.dirname(self._panel_log_path), exist_ok=True)
+                    with open(self._panel_log_path, "a", encoding="utf-8") as fh:
+                        fh.write(f"[{ts}] [{name}] {line.rstrip()}\n")
+            except OSError:
+                pass
 
     def _open_proc_logfile(self, name):
         """为进程 name 打开一个落盘日志文件（logs/<name>_<stamp>.log）。
@@ -687,7 +717,11 @@ class ProcManager:
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
-                self._log(name, line)
+                self._log(name, line, persist=False)
+                if (self.procs.get(name) is proc
+                        and "[GW-LIFECYCLE] close_unconfirmed" in line):
+                    self._backend_recovery_required = True
+                    self._log(name, "!! 旧会话关闭未确认；再次启动前请先全部停止")
                 if fh is not None:
                     try:
                         fh.write(line)
@@ -695,12 +729,17 @@ class ProcManager:
                     except Exception:
                         pass
                 # 命中就绪关键字：立即置位，_wait_ready_or_die 会马上放行
-                if pat and not self._ready_events[name].is_set() and pat.search(line):
+                if (self.procs.get(name) is proc and pat
+                        and not self._ready_events[name].is_set() and pat.search(line)):
                     self._ready_events[name].set()
-                    self._log(name, "✅ 就绪关键字命中(端口已监听)，直接进入下一步")
+                    self._log(name, "收到启动就绪日志")
         except Exception:
             pass
         finally:
+            code = proc.poll()
+            if code is not None:
+                self._log(name, f"进程日志结束 pid={proc.pid} exit={code} "
+                               f"hex=0x{code & 0xffffffff:08X}")
             if fh is not None:
                 try:
                     fh.close()
@@ -764,7 +803,7 @@ class ProcManager:
 
             0  语音控制    不加 → 走 no_funnel 分支，每轮取一帧直发
             2  质量筛选    --funnel --no-reject → 选 best 但永远放行
-            3  完整防幻觉  --funnel --force-measure → 选 best + 拒绝 + 语音提示
+            3  完整防幻觉  --funnel → 选 best + 静默拒绝，只记录日志
         """
         lv = int(self.chain().get("funnel", 0))
         if lv <= 0:
@@ -773,8 +812,6 @@ class ProcManager:
         args = ["--funnel", "--scene", scene]
         if lv == 2:
             args += ["--no-reject"]
-        else:
-            args += ["--force-measure", "--reject-wav-dir", self._reject_wav_dir()]
         return args
 
     def _check_deps(self):
@@ -837,7 +874,7 @@ class ProcManager:
     def _check_reject_wav(self):
         """档位④要播提示音，wav 必须事先用 gen_reject_wavs.py 生成好
         （且要在 duplex 没跑的时候生成）。这里只检查，不在面板里现场生成。"""
-        if int(self.chain().get("funnel", 0)) < 3:
+        if "--force-measure" not in self._funnel_extra_args():
             return True
         full = self._reject_wav_dir()
         try:
@@ -927,6 +964,8 @@ class ProcManager:
 
     # ---- 起停单个进程 ----
     def _spawn(self, name):
+        if not self._finish_job(name):
+            raise RuntimeError(f"{name}: previous child processes have not exited")
         self._ready_events[name].clear()  # ← 新增:重试/重启前复位就绪标记
         extra_env = {}
         if name == "rokid":
@@ -963,7 +1002,7 @@ class ProcManager:
             if _cwd and not os.path.isdir(_cwd):
                 self._log(name, f"!! cwd 无效，忽略并用当前目录: {_cwd}")
                 _cwd = None
-        _env = dict(os.environ)
+        _env = self._child_env()
         _env["PYTHONIOENCODING"] = "utf-8"
         _env["PYTHONUTF8"] = "1"
         _env.update(extra_env)   # rokid: ROKID_V7_LOG_FILE / PYTHONUNBUFFERED
@@ -981,15 +1020,39 @@ class ProcManager:
             creationflags=creationflags,
         )
         self.procs[name] = proc
+        if self.cfg["is_windows"]:
+            from runtime.openglass_omni.process_job import WindowsProcessJob
+            try:
+                job = WindowsProcessJob()
+                self._jobs[name] = job
+                job.assign(proc)
+            except Exception:
+                self._force_kill(proc)
+                self._finish_job(name)
+                raise
         threading.Thread(target=self._pump, args=(name, proc), daemon=True).start()
         return proc
+
+    def _finish_job(self, name):
+        job = self._jobs.get(name)
+        if job is None:
+            return True
+        try:
+            job.finish()
+            del self._jobs[name]
+            self._log(name, "进程组已清空（含子进程）")
+            return True
+        except Exception as exc:
+            self._log(name, f"!! 进程组清理失败: {exc}")
+            return False
 
     def _kill(self, name, graceful=False, grace_timeout=20):
         self._forget_tail_fp(name)   # 进程要没了，指纹一并作废
         proc = self.procs.get(name)
         if not proc or proc.poll() is not None:
-            self.status[name] = "stopped"
-            return
+            clean = self._finish_job(name)
+            self.status[name] = "stopped" if clean else "crashed"
+            return clean
         self._stopping.add(name)   # 标记：这是主动停止，别被轮询判成 crashed
         try:
             if self.cfg["is_windows"]:
@@ -1001,6 +1064,7 @@ class ProcManager:
                         proc.send_signal(_sig.CTRL_BREAK_EVENT)
                     except Exception as e:
                         self._log(name, f"CTRL_BREAK 失败({e})，改强杀")
+                        self._backend_recovery_required = True
                         ok = False
                     if ok:
                         try:
@@ -1008,14 +1072,15 @@ class ProcManager:
                             self._log(name, "demo 已优雅退出（落盘完成）")
                         except subprocess.TimeoutExpired:
                             self._log(name, f"{grace_timeout}s 未退出，强杀兜底")
+                            self._backend_recovery_required = True
                             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                           capture_output=True)
+                                           capture_output=True, timeout=10)
                     else:
                         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                       capture_output=True)
+                                       capture_output=True, timeout=10)
                 else:
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                   capture_output=True)
+                                   capture_output=True, timeout=10)
             else:
                 proc.terminate()
                 try:
@@ -1026,15 +1091,24 @@ class ProcManager:
             self._log(name, f"kill error: {e}")
         finally:
             self._stopping.discard(name)
-        self.status[name] = "stopped"
+        clean = self._finish_job(name)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.status[name] = "crashed"
+            self._log(name, f"!! PID {proc.pid} 尚未退出，禁止启动替代进程")
+            return False
+        self.status[name] = "stopped" if clean else "crashed"
+        return clean
 
     def _force_kill(self, proc):
         try:
             if self.cfg["is_windows"]:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                               capture_output=True)
+                               capture_output=True, timeout=10)
             else:
                 proc.kill()
+            proc.wait(timeout=3)
         except Exception:
             pass
 
@@ -1087,120 +1161,97 @@ class ProcManager:
         p = self.procs.get(name)
         return p is not None and p.poll() is None
 
+    def _child_env(self):
+        env = dict(os.environ)
+        # Keep external proxy settings, but never proxy local service traffic.
+        bypass = [env.get("NO_PROXY", ""), env.get("no_proxy", ""),
+                  "localhost", "127.0.0.1", "::1"]
+        env["NO_PROXY"] = env["no_proxy"] = ",".join(x for x in bypass if x)
+        return env
+
+    def _http_open(self, url, timeout):
+        import ssl
+        import urllib.request
+        # These are local services; system HTTP proxies must not intercept them.
+        handlers = [urllib.request.ProxyHandler({})]
+        if url.startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        return urllib.request.build_opener(*handlers).open(url, timeout=timeout)
+
     def _http_get_json(self, url, timeout=2.0):
-        import urllib.request, json as _json
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return _json.loads(r.read().decode("utf-8", "replace"))
+            with self._http_open(url, timeout) as response:
+                return json.loads(response.read().decode("utf-8", "replace"))
         except Exception:
             return None
 
     def _http_ok(self, url, timeout=2.0):
-        """GET 返回 HTTP 200 即 True（llama-omni-server /health 用，不解析 body）。"""
-        import urllib.request
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return 200 <= getattr(r, "status", r.getcode()) < 300
+            with self._http_open(url, timeout) as response:
+                return response.status == 200
         except Exception:
             return False
 
+    def _gateway_status(self):
+        url = self.cfg.get("gateway_status_url") or (
+            f"https://127.0.0.1:{self.cfg['gateway_port']}/status")
+        return self._http_get_json(url)
+
+    def _probe_ready(self, name):
+        if name == "llama":
+            return self._http_ok(self.cfg["llama_health_url"]), "backend /health"
+        if name == "worker":
+            port = self.cfg.get("worker_health_port") or self.cfg.get("worker_ready_port", 22400)
+            data = self._http_get_json(f"http://127.0.0.1:{port}/health") or {}
+            return data.get("status") == "healthy", f"worker health={data.get('status', 'unreachable')}"
+        if name == "gateway":
+            data = self._gateway_status() or {}
+            usable = sum(int(data.get(k, 0)) for k in ("idle_workers", "busy_workers", "duplex_workers"))
+            return bool(data.get("gateway_healthy") and usable), f"gateway workers={data}"
+        if name == "harness":
+            data = self._http_get_json(self.cfg.get("harness_health_url", "https://127.0.0.1:8021/health")) or {}
+            ready = data.get("ok") and data.get("enabled") and data.get("asr_loaded")
+            return bool(ready), f"harness health={data}"
+        if name == "rokid":
+            return self._http_ok(self.cfg["rokid_health_url"]), "rokid /health"
+        event = self._ready_events.get(name)
+        return bool(event and event.is_set()), "waiting for model session ready"
+
     def _wait_ready_or_die(self, name, timeout):
-        """等就绪，绝不永久卡住；被急停(_cancel)时立即返回 False。"""
-        t_start = time.time()
-        # llama backend 模型加载慢，用更长的专属超时
         if name == "llama":
             timeout = float(self.cfg.get("llama_ready_timeout_s", 300.0))
-        deadline = t_start + timeout
-        wport = self.cfg.get("worker_health_port")
-        health_probe_s = float(self.cfg.get("health_probe_s", 15.0))
-        stable_s = float(self.cfg.get("stable_alive_s", 8.0))
+        deadline = time.monotonic() + timeout
         last_log = 0.0
-        health_ever_reachable = False
-        llama_url = self.cfg.get("llama_health_url", "http://127.0.0.1:22500/health")
-        while time.time() < deadline:
-            if self._cancel.is_set():          # 急停：立刻放弃就绪等待
-                self._log(name, "就绪等待被急停打断")
+        detail = "not probed"
+        while time.monotonic() < deadline:
+            if self._cancel.is_set() or not self._alive(name):
                 return False
-            p = self.procs.get(name)
-            if p is None or p.poll() is not None:
-                return False
-            # 关键字就绪优先：一旦泵线程命中(如 worker 的 22400)立刻放行
-            if self._ready_events.get(name) is not None and self._ready_events[name].is_set():
-                self._log(name, "就绪(关键字命中)，放行")
+            ready, detail = self._probe_ready(name)
+            if ready and not self._cancel.is_set() and self._alive(name):
+                self._log(name, f"Ready: {detail}")
+                if name == "rokid":
+                    self._rokid_post_launch()
                 return True
-            elapsed = time.time() - t_start
-            if name == "harness":
-                # 8021 是自签 wss，不能用 HTTP health，只能探 TCP 端口。
-                # 而且端口开了之后 /ws/control 还要一小会儿才绑好，
-                # 不等的话 esp32_runtime 连过去会失败。
-                if self._port_open(8021):
-                    self._log("harness", "8021 端口已开，再等 2s 让 /ws/control 绑好")
-                    time.sleep(2.0)
-                    self._log("harness", "harness 就绪，放行")
-                    return True
-                _now = time.time()
-                if _now - last_log > 5:
-                    last_log = _now
-                    self._log("harness", f"等待 8021 (FunASR 模型加载中) {elapsed:.0f}s")
-                time.sleep(1.0)
-                continue
-            if name == "llama":
-                # llama-omni-server：轮询 /health 返回 200 才放行（= 你手动的 curl .../health）
-                if self._http_ok(llama_url):
-                    self._log("llama", f"/health 200，backend 就绪，放行")
-                    return True
-                now = time.time()
-                if now - last_log > 5:
-                    self._log("llama", f"等待 backend 加载模型… ({elapsed:.0f}s) {llama_url}")
-                    last_log = now
-            elif name == "worker":
-                if wport:
-                    h = self._http_get_json(f"http://localhost:{wport}/health")
-                    if h is not None:
-                        health_ever_reachable = True
-                        if h.get("status") == "healthy":
-                            self._log("worker", "/health = healthy")
-                            return True
-                    now = time.time()
-                    if now - last_log > 3:
-                        st = h.get("status") if h else "无响应"
-                        self._log("worker", f"等待就绪… /health status={st}")
-                        last_log = now
-                    if (not health_ever_reachable) and elapsed >= health_probe_s and elapsed >= stable_s:
-                        self._log("worker", f"!! {health_probe_s:.0f}s 内 /health 无响应"
-                                            f"(检查 worker_health_port，当前={wport})，"
-                                            f"已按进程稳定存活放行")
-                        return True
-                else:
-                    if elapsed >= stable_s:
-                        return True
-            elif name == "gateway":
-                if self._port_open(self.cfg["gateway_port"]):
-                    return True
-                if elapsed >= max(health_probe_s, stable_s):
-                    self._log("gateway", f"!! {self.cfg['gateway_port']} 未探到，已按稳定存活放行")
-                    return True
-            elif name == "rokid":
-                # bridge 起来了 = 18080 /health 返回 200（真探测，不是 sleep）。
-                # 就绪只代表"PC 侧在等眼镜连"，眼镜连没连要看 /health 里的 clients。
-                if self._http_ok(self.cfg.get("rokid_health_url",
-                                              "http://127.0.0.1:18080/health")):
-                    self._log("rokid", "/health 200，bridge 就绪，等待眼镜 APK 连入")
-                    self._rokid_post_launch()   # USB：此时才拉起 APK（ps1 里也是等 health 再拉）
-                    return True
-                now = time.time()
-                if now - last_log > 3:
-                    self._log("rokid", f"等待 bridge 监听 {self.cfg.get('rokid_port', 18080)}… ({elapsed:.0f}s)")
-                    last_log = now
-            else:  # demo
-                if elapsed >= 3:
-                    return True
-            if not self._sleep(0.4):            # 可被急停打断的间隔
+            if time.monotonic() - last_log >= 5:
+                self._log(name, f"Waiting: {detail}")
+                last_log = time.monotonic()
+            if not self._sleep(0.4):
                 return False
-        p = self.procs.get(name)
-        if p is not None and p.poll() is None and not self._cancel.is_set():
-            self._log(name, "就绪探测超时，但进程存活，放行")
-            return True
+        self._log(name, f"Readiness timeout ({timeout:.0f}s): {detail}; downstream startup blocked")
+        return False
+
+    def _wait_gateway_idle(self, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._cancel.is_set():
+            if not all(self._alive(n) for n in ("llama", "worker", "gateway")):
+                self._log("gateway", "Upstream process exited; client startup blocked")
+                return False
+            data = self._gateway_status() or {}
+            if data.get("gateway_healthy") and int(data.get("idle_workers", 0)) > 0:
+                return True
+            if not self._sleep(0.5):
+                return False
+        self._log("gateway", "No idle worker after session shutdown; client startup blocked")
         return False
 
     def _start_one(self, name):
@@ -1212,7 +1263,22 @@ class ProcManager:
             if self._cancel.is_set():
                 return False
             self.status[name] = "starting"
-            self._spawn(name)
+            if name == self.tail() and self._backend_recovery_required:
+                self.status[name] = "crashed"
+                self._log(name, "!! 旧会话关闭未确认；请先全部停止再启动")
+                return False
+            if name == self.tail() and not self._wait_gateway_idle():
+                self.status[name] = "crashed"
+                return False
+            if self._alive(name):
+                self._log(name, "!! 旧进程尚未退出，中止重复启动")
+                return False
+            try:
+                self._spawn(name)
+            except Exception as exc:
+                self.status[name] = "crashed"
+                self._log(name, f"!! 启动/进程托管失败: {exc}")
+                return False
             if self._wait_ready_or_die(name, ready_timeout):
                 self.status[name] = "running"
                 if name == self.tail():
@@ -1222,8 +1288,12 @@ class ProcManager:
             # 未就绪/退出/被急停：先把这次 spawn 的进程杀干净，绝不留残余
             p = self.procs.get(name)
             code = p.poll() if p is not None else None
-            if p:
-                self._force_kill(p)
+            if p and not self._kill(name, graceful=(name == self.tail()), grace_timeout=30):
+                return False
+            if name == self.tail():
+                self.status[name] = "crashed"
+                self._log(name, "!! 客户端未就绪，已停止；不自动重复创建模型会话")
+                return False
             if self._cancel.is_set():           # 急停：不再重试
                 self.status[name] = "stopped"
                 return False
@@ -1263,38 +1333,34 @@ class ProcManager:
                 self.current_device, self.current_prompt)
 
     def _sweep_stale(self):
-        """启动前扫一遍：上次没清干净的残留进程，现在杀掉。
-
-        为什么需要：panel 异常退出、或用户直接关窗口时，子进程可能还活着。
-        它们占着端口，而且 gateway 里的旧 session 还挂着 —— 下次启动的会话
-        就永远卡在 `[GW] queue position=1 eta=0.0`，模型一句话都不回，
-        表面上却是"链路正常、漏斗照常送图"，极难看出问题在哪。
-        （实测踩过，只能重启电脑。）
-        """
+        # A port alone does not prove that its owner belongs to this panel.
         stale = []
         for label, port in self._all_ports():
-            if self.procs.get(label) is not None and self._alive(label):
-                continue          # 本次自己起的，不动
+            if self._alive(label):
+                continue
+            if label == "demo" and (
+                port == 8080 and any(self._alive(n) for n in ("demo", "demo_funnel", "rokid"))
+                or port == 18080 and self._alive("rokid")
+            ):
+                continue
             if self._port_open(port):
-                stale.append((label, port))
-        if not stale:
-            return
-        self._log("gateway", "启动前清理：发现上次残留的端口占用 "
-                  + ", ".join(f"{l}:{p}" for l, p in stale))
-        for label, port in stale:
-            self._kill_by_port(port)
-        time.sleep(1.0)
-        left = [f"{l}:{p}" for l, p in stale if self._port_open(p)]
-        if left:
-            self._log("gateway", "!! 仍被占用: " + ", ".join(left)
-                      + "（可能是别的程序在用这些端口）")
-        else:
-            self._log("gateway", "启动前清理完成，端口已释放")
+                stale.append(f"{label}:{port}")
+        if stale:
+            self._log("gateway", "Startup blocked: ports already occupied outside this panel: "
+                      + ", ".join(stale) + "; stop the old instance first (no automatic kill)")
+            return False
+        return True
 
     def _do_start_all(self):
+        if self._shutting_down:
+            return
+        if self._backend_recovery_required:
+            self._log("gateway", "!! 上次会话未安全关闭；请先全部停止，再启动")
+            return
         # ②③④ 的两个前置检查：extensions 复制了没、档位④的 wav 有没有。
         # 提前拦住比跑起来才发现好 —— 后者时 duplex 已在跑，没法当场补。
-        self._sweep_stale()
+        if not self._sweep_stale():
+            return
         if (not self._check_extensions() or not self._check_deps()
                 or not self._check_reject_wav()):
             return
@@ -1304,9 +1370,20 @@ class ProcManager:
         for other in self._other_tails():
             if self._alive(other):
                 self._log(other, "!! 另一条链路的客户端仍在运行，先停掉（同一 gateway 不能双占）")
-                self._kill(other, graceful=True, grace_timeout=120)
+                if not self._kill(other, graceful=True, grace_timeout=120):
+                    return
 
-        for name in self.chain_procs():
+        order = self.chain_procs()
+        for index, stage in enumerate(order):
+            if stage in ("llama", "worker", "gateway") and not self._alive(stage):
+                # 下游不能沿用已经失效的上游连接。
+                for downstream in reversed(order[index + 1:]):
+                    if self._alive(downstream) and not self._kill(
+                            downstream, graceful=(downstream == self.tail()), grace_timeout=120):
+                        return
+                break
+
+        for name in order:
             if self._cancel.is_set():
                 return
             if self._alive(name):
@@ -1317,14 +1394,19 @@ class ProcManager:
                     got = self._tail_started_for.get(name)
                     if got is not None and got != want:
                         self._log(name, "配置已变（链路/判据/眼镜/Prompt），重启该进程")
-                        self._kill(name, graceful=True, grace_timeout=120)
+                        if not self._kill(name, graceful=True, grace_timeout=120):
+                            return
                     else:
                         self.status[name] = "running"
                         self._log(name, "已在运行，跳过启动")
                         continue
                 else:
+                    self.status[name] = "starting"
+                    if not self._wait_ready_or_die(name, self.cfg.get("ready_timeout_s", 120)):
+                        self.status[name] = "crashed"
+                        self._log(name, "!! 已有进程未通过健康检查，中止后续启动")
+                        return
                     self.status[name] = "running"
-                    self._log(name, "已在运行，跳过启动")
                     continue
             if not self._start_one(name):
                 if self._cancel.is_set():
@@ -1333,17 +1415,41 @@ class ProcManager:
                     self._log(name, "!! 未能就绪，中止后续启动")
                 return
 
-    def start_all(self):
-        """一键启动：串行独占，重复点击直接忽略（杜绝多开）。"""
+    def _configure(self, prompt=None, device=None, chain=None, scene=None):
+        if prompt:
+            self.current_prompt = prompt
+        if device:
+            self.current_device = device
+        if chain in self.cfg["chains"]:
+            self.current_chain = chain
+        if scene in self.cfg.get("scenes", {}):
+            self.current_scene = scene
+
+    def configure(self, **values):
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        try:
+            self._configure(**values)
+            return True
+        finally:
+            self._op_lock.release()
+
+    def start_all(self, **values):
+        # Acquire before dispatch: UI changes cannot alter a launch in progress.
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        if self._shutting_down:
+            self._op_lock.release()
+            return False
+        self._configure(**values)
+        self._cancel.clear()
         def run():
-            if not self._op_lock.acquire(blocking=False):
-                return  # 已有启停操作在进行，忽略这次点击
             try:
-                self._cancel.clear()
                 self._do_start_all()
             finally:
                 self._op_lock.release()
         threading.Thread(target=run, daemon=True).start()
+        return True
 
     def _stop_all_sync(self):
         # 先停另一条链可能残留的尾巴，再按当前链路逆序停。
@@ -1351,17 +1457,17 @@ class ProcManager:
         tails = {c["tail"] for c in self.cfg["chains"].values()}
         for other in self._other_tails():
             if self._alive(other):
-                self._kill(other, graceful=True)
+                self._kill(other, graceful=True, grace_timeout=120)
                 time.sleep(0.3)
         for name in self.chain()["stop_order"]:
-            self._kill(name, graceful=(name in tails))
+            self._kill(name, graceful=(name in tails), grace_timeout=120)
             time.sleep(0.3)
         # 当前链路的 stop_order 只覆盖这条链；切过链路的话别的进程会漏掉。
         # 兜底：把 procs 里所有还活着的都停掉。
         for name in self.cfg["procs"]:
             if self._alive(name):
                 self._log(name, "不在当前链路但仍在运行，一并停止")
-                self._kill(name, graceful=(name in tails))
+                self._kill(name, graceful=(name in tails), grace_timeout=120)
                 time.sleep(0.2)
         for name in self.cfg["procs"]:
             proc = self.procs.get(name)
@@ -1370,33 +1476,22 @@ class ProcManager:
             if proc is not None:
                 self._log(name, "!! 仍在运行，强杀兜底")
                 self._force_kill(proc)
-        # ★ 逐个清理所有已知端口，不只 gateway。
-        #   以前只等 gateway 释放，llama/worker/harness/web_ui 的残留进程会一直
-        #   占着端口；下次启动时 gateway 那边旧 session 还挂着，新会话就永远
-        #   卡在 `[GW] queue position=1 eta=0.0` —— 表现是"链路看着活的、
-        #   漏斗照常送图，但模型一句话都不回"，只能重启电脑。
-        for _label, _port in self._all_ports():
-            if self._wait_port(_port, up=False, timeout=4):
-                continue
-            self._log(_label, f"!! 端口 {_port} 仍被占用，按端口强杀")
-            self._kill_by_port(_port)
-        # 再确认一遍；还占着就再杀一次（有些进程要两拍才退）
-        _still = [(l, p) for l, p in self._all_ports()
-                  if not self._wait_port(p, up=False, timeout=2)]
-        for _label, _port in _still:
-            self._log(_label, f"!! 端口 {_port} 二次强杀")
-            self._kill_by_port(_port)
-            time.sleep(0.5)
-        _left = [f"{l}:{p}" for l, p in self._all_ports()
-                 if not self._wait_port(p, up=False, timeout=1)]
-        if _left:
-            self._log("gateway", "!! 以下端口仍被占用，可能需要手动处理: "
-                                 + ", ".join(_left))
-        else:
-            self._log("gateway", "所有端口已释放，全部已停止")
+        # Never kill an unrelated process merely because it has reused a port.
+        for name in list(self._jobs):
+            self._finish_job(name)
+        left = [f"{label}:{port}" for label, port in self._all_ports() if self._port_open(port)]
+        if left:
+            self._log("gateway", "Ports still occupied: " + ", ".join(left))
         for name in self.cfg["procs"]:
-            self.status[name] = "stopped"
+            self.status[name] = "crashed" if self._alive(name) or name in self._jobs else "stopped"
             self._forget_tail_fp(name)
+        if not any(self._alive(name) for name in self.cfg["procs"]) and not left and not self._jobs:
+            self._backend_recovery_required = False
+            self._log("gateway", "全部停止完成：托管进程及子进程已退出，服务端口已释放")
+            return True
+        self._backend_recovery_required = True
+        self._log("gateway", "!! 清理未完成，禁止重新启动；请查看残留进程/端口日志")
+        return False
 
     def stop_all(self):
         """全部停止：等同三个 Ctrl+C。先发急停打断任何正在进行的启动，再彻底杀干净。"""
@@ -1413,35 +1508,28 @@ class ProcManager:
             self._cancel.set()
             with self._op_lock:
                 self._cancel.clear()
-                self._stop_all_sync()
+                if not self._stop_all_sync():
+                    return
                 if not self._sleep(1.5):
                     return
                 self._do_start_all()
         threading.Thread(target=run, daemon=True).start()
 
     def restart_demo(self, prompt, device=None):
-        """切 prompt = 用新 prompt 重启当前链路的第四级（demo 或 rokid bridge）。
-        worker/gateway 不动。忙则忽略防多开。"""
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        self._configure(prompt=prompt, device=device)
+        self._cancel.clear()
         def run():
-            if not self._op_lock.acquire(blocking=False):
-                return
             try:
-                if prompt:
-                    self.current_prompt = prompt
-                if device:
-                    self.current_device = device
-                t = self.tail()                      # ← demo 或 rokid
-                self._kill(t, graceful=True, grace_timeout=120)
-                if not self._sleep(1.0):
+                if not self._kill(self.tail(), graceful=True, grace_timeout=120):
                     return
-                self.status[t] = "starting"
-                self._spawn(t)
-                if not self._sleep(1.0):
-                    return
-                self.status[t] = "running" if self.procs[t].poll() is None else "crashed"
+                # Reuse the same readiness/dependency path as a full start.
+                self._do_start_all()
             finally:
                 self._op_lock.release()
         threading.Thread(target=run, daemon=True).start()
+        return True
 
     def stop_demo(self):
         """停止：只停当前链路的第四级（优雅落盘），保住 worker/gateway。忙则忽略。"""
@@ -1455,13 +1543,12 @@ class ProcManager:
         threading.Thread(target=run, daemon=True).start()
 
     def set_chain(self, chain):
-        """切链路。若已有进程在跑，停掉另一条链的尾巴由下次 start_all 处理。"""
-        if chain in self.cfg["chains"]:
-            self.current_chain = chain
+        self.configure(chain=chain)
         return self.current_chain
 
     def shutdown(self):
         """关窗时同步清理，阻塞直到全停（比原来的异步 stop_all 更可靠）。"""
+        self._shutting_down = True
         self._cancel.set()
         with self._op_lock:
             self._stop_all_sync()
@@ -1521,27 +1608,14 @@ class Api:
         return self.mgr.set_chain(chain)
 
     def set_scene(self, scene):
-        if scene:
-            self.mgr.current_scene = scene
-        return "ok"
+        return "ok" if self.mgr.configure(scene=scene) else "busy"
 
     def set_device(self, device):
-        if device:
-            self.mgr.current_device = device
-        return "ok"
+        return "ok" if self.mgr.configure(device=device) else "busy"
 
     def start_all(self, prompt=None, device=None, chain=None, scene=None):
-        # prompt 来自前端文本框（用户选的 preset 或编辑后的内容）。在起进程前更新
-        # current_prompt，否则一键启动只会用初始的第一个 preset。
-        if prompt:
-            self.mgr.current_prompt = prompt
-        if chain:
-            self.mgr.set_chain(chain)
-        if device:
-            self.mgr.current_device = device
-        if scene:
-            self.mgr.current_scene = scene
-        self.mgr.start_all(); return "ok"
+        return "ok" if self.mgr.start_all(
+            prompt=prompt, device=device, chain=chain, scene=scene) else "busy"
 
     def stop_all(self):
         self.mgr.stop_all(); return "ok"

@@ -169,7 +169,7 @@ def _emit_chunk_img(web_ui, jpeg: bytes, idx: int, img_sent: bool, age_ms: int =
     img_sent=False 表示这帧没送模型（被漏斗拦下或不是 best）。第一视角照样显示，
     这样画面才连续、也能看见"被拦的是什么样的图"——对演示④反而更有说服力。
     """
-    if web_ui is None or not getattr(web_ui, "live_clients", None):
+    if web_ui is None:
         return
     try:
         b64 = base64.b64encode(jpeg).decode("ascii") if jpeg else None
@@ -906,25 +906,40 @@ async def esp32_image_loop(
     peer_done: Optional[asyncio.Event] = None,
     done_evt: Optional[asyncio.Event] = None,
 ) -> None:
-    # ★ 这里**不等** ready_evt。
-    #   就绪门的本意是"别把音视频推给还没建好的会话"，不是"别抓图"。
-    #   抓图、漏斗判定、推第一视角都是纯本地的，挡在这里只会让
-    #   panel 内嵌的第一视角在 gateway 就绪前（20~30s）一片空白 ——
-    #   而眼镜自己的 http://<ip> stream 一点就有画面，对比之下像是坏了。
-    #   真正需要等的是下面"送图给模型"那一步，见 _gate_ready() 的用法。
     _model_gate = ready_evt
     _gate_logged = False
 
-    async def _wait_model_ready():
-        """送图给模型之前调用：会话没就绪就等，等的时候只打一次日志。"""
+    def _model_ready():
         nonlocal _gate_logged
-        if _model_gate is None or _model_gate.is_set():
-            return
-        if not _gate_logged:
+        ready = _model_gate is None or _model_gate.is_set()
+        if manager is not None:
+            ready = (ready and manager.active is not None
+                     and manager.active.status == "running"
+                     and not manager.gate.restart_in_progress)
+        if not ready and not _gate_logged:
+            LOG.info("[ESP32] Model not ready; continuing local preview without model input")
             _gate_logged = True
-            LOG.info("[ESP32] 会话尚未就绪，图像先只走本地（第一视角/录制），"
-                     "就绪后再开始送模型")
-        await _model_gate.wait()
+        return ready
+
+    async def _pace_round(started):
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=max(0.01, interval_s - (time.monotonic() - started)))
+        except asyncio.TimeoutError:
+            pass
+
+    async def _send_funnel(kind, reason, generation):
+        if not force_measure or stop_evt.is_set() or manager is None:
+            return False
+        if manager.gate.restart_in_progress or manager.gate.generation != generation:
+            return False
+        await harness.send({"type": kind, "reason": reason, "generation": generation})
+        return True
+
+    def _spawn_control(coro):
+        task = asyncio.create_task(coro)
+        manager._background_controls.add(task)
+        task.add_done_callback(manager._background_controls.discard)
+        return task
 
     LOG.info("[ESP32] image loop start (interval=%.2fs, funnel=%s)",
              interval_s, "on" if funnel else "off")
@@ -1013,9 +1028,11 @@ async def esp32_image_loop(
                     # 第一视角先推 —— 它是纯本地的，不该等会话。
                     # （web_ui 用的是 latest_frame.sequence 之前的值，差一个序号
                     #   不影响显示；换来的是开机就有画面，而不是空白 20~30s。）
-                    _emit_chunk_img(web_ui, jpeg, latest_frame.sequence + 1, True)
+                    _emit_chunk_img(web_ui, jpeg, latest_frame.sequence + 1, _model_ready())
                     # 送给模型之前才等会话就绪
-                    await _wait_model_ready()
+                    if not _model_ready():
+                        await _pace_round(t0)
+                        continue
                     latest_frame.set(jpeg, ts)
                     stats.image_count += 1
                     await harness.send_frame(jpeg, latest_frame.sequence, ts)
@@ -1056,7 +1073,7 @@ async def esp32_image_loop(
                     except Exception as e:
                         LOG.warning("[LIVE] on_funnel_round err: %s", e)
                 grab_ms = decision.timings.get("grab_ms", 0.0)
-                async def _do_reject_interrupt(reason):
+                async def _do_reject_interrupt(reason, generation):
                     """外壳：保证"发了 stop 就一定有人负责 resume"。
 
                     里层 _inner 有几处 await（sleep 0.35、播报、sleep(dur)）。
@@ -1067,17 +1084,16 @@ async def esp32_image_loop(
                     （正常超时的情况由 _stop_watchdog 兜底，两者互不替代。）
                     """
                     try:
-                        await _do_reject_interrupt_shell(reason)
+                        await _do_reject_interrupt_shell(reason, generation)
                     except asyncio.CancelledError:
                         LOG.warning("[强制措施] 播报被取消，补发 funnel.resume 以免卡在停止态")
                         try:
-                            await harness.send({"type": "funnel.resume",
-                                                "reason": "hint_cancelled"})
+                            await _send_funnel("funnel.resume", "hint_cancelled", generation)
                         except Exception:
                             pass
                         raise
 
-                async def _do_reject_interrupt_shell(reason):
+                async def _do_reject_interrupt_shell(reason, generation):
                     """真正执行打断：停 duplex → 播 wav → 恢复。
 
                     **在后台任务里跑，不能让 image_loop 同步等它**：
@@ -1091,13 +1107,13 @@ async def esp32_image_loop(
                     nonlocal _hint_playing
                     _hint_playing = True
                     try:
-                        await _do_reject_interrupt_inner(reason)
+                        await _do_reject_interrupt_inner(reason, generation)
                     finally:
                         _hint_playing = False
 
                 _USER_STOP_AUTO_RESUME_S = 20.0   # 用户 STOP 后多久自动恢复对话
 
-                async def _auto_resume_later(cnt_at_stop):
+                async def _auto_resume_later(cnt_at_stop, generation):
                     """用户在提示音期间按了 STOP —— 尊重它，但别永久锁死。
 
                     等一段时间后，如果 stop_count 没再变（说明用户没有反复要求
@@ -1114,14 +1130,13 @@ async def esp32_image_loop(
                         LOG.debug("[强制措施] 自动恢复取消：期间又有新的 STOP")
                         return
                     try:
-                        await harness.send({"type": "funnel.resume",
-                                            "reason": "user_stop_timeout"})
+                        await _send_funnel("funnel.resume", "user_stop_timeout", generation)
                         LOG.info("[强制措施] 用户 STOP 已过 %.0fs，自动恢复对话",
                                  _USER_STOP_AUTO_RESUME_S)
                     except Exception as e:
                         LOG.warning("[强制措施] 自动恢复失败: %s", e)
 
-                async def _do_reject_interrupt_inner(reason):
+                async def _do_reject_interrupt_inner(reason, generation):
                     wav_pcm = _load_reject_wav(reject_wav_dir, reason)
                     if wav_pcm is None:
                         LOG.warning("[强制措施] 无 %s.wav，跳过播报", reason)
@@ -1135,7 +1150,8 @@ async def esp32_image_loop(
                     #   （播报改成后台任务之后，这个并发窗口更大了。）
                     _gate = getattr(manager, "gate", None)
                     try:
-                        await harness.send({"type": "funnel.stop", "reason": reason})
+                        if not await _send_funnel("funnel.stop", reason, generation):
+                            return
                         LOG.info("[强制措施] funnel.stop 已发 (%s)", reason)
                     except Exception as e:
                         LOG.warning("[强制措施] funnel.stop 失败: %s", e)
@@ -1146,6 +1162,8 @@ async def esp32_image_loop(
                     #   于是播完时 _now != _owned 恒成立 —— resume 一次都发不出去，
                     #   模型永远停着，说什么都进不去（实测：开局第一次 reject 就锁死，
                     #   只能靠 harness 那条腿说"恢复对话"才能救回来）。
+                    if stop_evt.is_set() or manager.gate.restart_in_progress or manager.gate.generation != generation:
+                        return
                     _owned = getattr(_gate, "stop_count", None) if _gate else None
                     try:
                         await speaker.resume()
@@ -1165,13 +1183,13 @@ async def esp32_image_loop(
                         # 是想让当前这句别说了，不是想让系统从此哑掉。
                         # 挂一个兜底：过 _USER_STOP_AUTO_RESUME_S 之后，若期间
                         # 没有再新增 stop，就自动恢复对话。
-                        asyncio.create_task(_auto_resume_later(_now_cnt))
+                        _spawn_control(_auto_resume_later(_now_cnt, generation))
                         LOG.info("[强制措施] 播报期间收到新的 STOP"
                                  "（stop_count %s→%s），保留用户的停止状态，不 resume",
                                  _owned, _now_cnt)
                         return
                     try:
-                        await harness.send({"type": "funnel.resume", "reason": "hint_done"})
+                        await _send_funnel("funnel.resume", "hint_done", generation)
                         LOG.info("[强制措施] funnel.resume 已发（提示播完）")
                     except Exception as e:
                         LOG.warning("[强制措施] funnel.resume 失败: %s", e)
@@ -1185,9 +1203,11 @@ async def esp32_image_loop(
                     if _b:
                         ts = now_ms()
                         # 第一视角先推，不等会话（纯本地）
-                        _emit_chunk_img(web_ui, _b, latest_frame.sequence + 1, True)
+                        _emit_chunk_img(web_ui, _b, latest_frame.sequence + 1, _model_ready())
                         # 送给模型之前才等会话就绪
-                        await _wait_model_ready()
+                        if not _model_ready():
+                            await _pace_round(t0)
+                            continue
                         latest_frame.set(_b, ts)
                         stats.image_count += 1
                         await harness.send_frame(_b, latest_frame.sequence, ts)
@@ -1220,21 +1240,27 @@ async def esp32_image_loop(
                 #   只推 best 的话，④ 拦得多时画面会一卡一卡（实测就是这个现象）；
                 #   而且看不到"被拦的图长什么样"。整簇都推，画面连续，
                 #   前端还能按 img_sent / reject_reason 标出哪张真送了模型。
-                if web_ui is not None and getattr(web_ui, "live_clients", None):
+                if web_ui is not None:
                     _all = list(decision.frames or [])
                     _bi = decision.best_index if isinstance(decision.best_index, int) else -1
                     if not _all and decision.best:
                         _all, _bi = [decision.best], 0
                     for _i, _f in enumerate(_all):
-                        _is_best_sent = bool(decision.send) and _i == _bi
+                        _is_best_sent = bool(decision.send) and _i == _bi and _model_ready()
                         _emit_chunk_img(web_ui, _f, latest_frame.sequence,
                                         _is_best_sent,
                                         reason="" if decision.send else (decision.reason or ""))
 
+                if not _model_ready():
+                    await _pace_round(t0)
+                    continue
+
                 if decision.send and decision.best:
                     ts = now_ms()
                     # 送给模型之前才等会话就绪（抓图/第一视角/录制不受影响）
-                    await _wait_model_ready()
+                    if not _model_ready():
+                        await _pace_round(t0)
+                        continue
                     latest_frame.set(decision.best, ts)
                     stats.image_count += 1
                     await harness.send_frame(decision.best, latest_frame.sequence, ts)
@@ -1277,7 +1303,7 @@ async def esp32_image_loop(
                             if (not _hint_playing
                                     and now_mono - _last_hint_mono >= _HINT_THROTTLE_S):
                                 _last_hint_mono = now_mono
-                                asyncio.create_task(_do_reject_interrupt(decision.reason))
+                                _spawn_control(_do_reject_interrupt(decision.reason, manager.gate.generation))
                 # ── 「持续坏」检测（优先于标点保护）──
                 #   3s 窗口内"真坏"reject≥2 → 输出基于坏图=幻觉。此时不走标点保护
                 #   （前半也错，不值得保护），直接触发"停→播提示→恢复"。
@@ -1292,7 +1318,8 @@ async def esp32_image_loop(
                                      if _now - t <= _WINDOW_S]
                 _bad_in_window = sum(1 for (_t, r) in _judge_history if r)
 
-                if _bad_in_window >= _BAD_THRESH and _is_real_bad:
+                if (force_measure and speaker is not None
+                        and _bad_in_window >= _BAD_THRESH and _is_real_bad):
                     _pending_reject = None  # 持续坏优先，取消标点保护挂起
                     # 到这里必是"真坏"(severe_shake/unstable/too_dark/orient)。
                     # **必须和标点保护那条一样受 _HINT_THROTTLE_S 约束**：
@@ -1321,7 +1348,7 @@ async def esp32_image_loop(
                         live_rec.log_event(
                             "PERSIST-BAD",
                             f"3s内{_bad_in_window}次真坏 → 打断 ({decision.reason})")
-                    asyncio.create_task(_do_reject_interrupt(decision.reason))
+                    _spawn_control(_do_reject_interrupt(decision.reason, manager.gate.generation))
                     elapsed = time.monotonic() - t0
                     try:
                         await asyncio.wait_for(stop_evt.wait(),
@@ -1357,7 +1384,7 @@ async def esp32_image_loop(
                                     and now_mono - _last_hint_mono >= _HINT_THROTTLE_S):
                                 _last_hint_mono = now_mono
                                 _pending_reject = None
-                                asyncio.create_task(_do_reject_interrupt(decision.reason))
+                                _spawn_control(_do_reject_interrupt(decision.reason, manager.gate.generation))
                             else:
                                 _pending_reject = None  # 被节流
 
@@ -1715,23 +1742,17 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             held_since = held_count = None
 
     async def _gate_open_when_ready(self, ready_evt: asyncio.Event) -> None:
-        """等 gateway 就绪后放行音视频任务（live 和 rerun 共用）。"""
-        try:
-            await self._wait_gateway_ready()
-        finally:
-            # 录制的 t0 必须和回放起点一致，否则 frames.jsonl/subtitles 的时间轴
-            # 会把排队那几十秒也算进去，两个 arm 无法对齐。
-            if self.live_rec is not None:
-                self.live_rec.start()
-                LOG.info("[LIVE] 录制已开（gateway 就绪后启动，结束自动出 mp4）")
-            # 统一回放零点：音频按 40ms 绝对时钟推、图按 frames.jsonl 的 t 等待，
-            # 两者必须用同一个 t0，否则各自以"自己被调度到的那一刻"为零点，
-            # 起跑差多少全看事件循环，音图就对不齐。
-            self._replay_t0 = time.monotonic()
-            _rc = getattr(self, "_rec_client", None)
-            if _rc is not None:
-                _rc.replay_t0 = self._replay_t0
-            ready_evt.set()
+        ready = await self._wait_gateway_ready()
+        if not ready or self._stop_evt.is_set():
+            return
+        if self.live_rec is not None:
+            self.live_rec.start()
+            LOG.info("[LIVE] recording started after model session ready")
+        self._replay_t0 = time.monotonic()
+        client = getattr(self, "_rec_client", None)
+        if client is not None:
+            client.replay_t0 = self._replay_t0
+        ready_evt.set()
 
     async def _wait_gateway_ready(self, timeout_s: float = 180.0) -> bool:
         """等 duplex session 真正 prepared 之后再开始回放。
@@ -1760,7 +1781,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
                 warned = True
                 LOG.info("[RERUN] 等 gateway session 就绪…（status=%s）", status or "?")
             await asyncio.sleep(0.25)
-        LOG.warning("[RERUN] 等 gateway 就绪超时 %.0fs，仍开始回放（本次结果可能不可用）",
+        LOG.warning("[RERUN] 等 gateway 就绪超时 %.0fs，保持输入关闭；本地预览不受影响",
                     timeout_s)
         return False
 
@@ -1822,7 +1843,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         if self._rerun_from:
             LOG.info("[RERUN] 模式启动，回放 session: %s", self._rerun_from)
             _ready = asyncio.Event()
-            asyncio.create_task(self._gate_open_when_ready(_ready))
+            self._ready_task = asyncio.create_task(self._gate_open_when_ready(_ready))
             self._tasks = [
                 asyncio.create_task(self.harness.run()),
                 asyncio.create_task(self._initial_session_loop()),
@@ -1857,7 +1878,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         if self._funnel_rerun_from:
             no_funnel = (self._funnel is None)
             _ready = asyncio.Event()
-            asyncio.create_task(self._gate_open_when_ready(_ready))
+            self._ready_task = asyncio.create_task(self._gate_open_when_ready(_ready))
             LOG.info("[RERUN] %s 模式启动: %s",
                      "无漏斗对照组" if no_funnel else "funnel 重跑漏斗+播报",
                      self._funnel_rerun_from)
@@ -1920,7 +1941,7 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
         #     · 掉够次数就判 no_frames → 停模型播"没有拿到画面"
         #   现象就是"开头一段时间画面丢失 + 模型不回话"，gateway 一 running 就自愈。
         _ready = asyncio.Event()
-        asyncio.create_task(self._gate_open_when_ready(_ready))
+        self._ready_task = asyncio.create_task(self._gate_open_when_ready(_ready))
         self._tasks = [
             # ── 继承自 rokid 的三个骨架 task ──
             asyncio.create_task(self.harness.run()),
@@ -1959,6 +1980,12 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
 
     async def close(self) -> None:
         self._stop_evt.set()
+        ready_task = getattr(self, "_ready_task", None)
+        if ready_task is not None:
+            ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
+        # Disconnect model/control tasks before potentially slow video finalization.
+        await super().close()
         if self._web_ui is not None:
             try:
                 await self._web_ui.stop()
@@ -1995,7 +2022,6 @@ class PhaseBEsp32Runtime(PhaseBRokidRuntime):
             self._probe.close()
         if self._recorder is not None:
             self._recorder.close()
-        await super().close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2012,6 +2038,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-timeout-s", type=float, default=1.0, help="单次取图超时(秒)")
     # ── gateway / harness（与 rokid 一致）──
     p.add_argument("--gateway", default="localhost:8040")
+    p.add_argument("--backend-close-url", default="",
+                   help="llama backend HTTP base URL; wait for completed cleanup before session reuse")
     p.add_argument("--gateway-proto", default="auto",
                    choices=("auto", "duplex", "realtime"),
                    help="gateway 协议。duplex=/ws/duplex（V1）；"
@@ -2080,6 +2108,7 @@ def main() -> None:
     )
     config = RokidRuntimeConfig(
         gateway=args.gateway,
+        backend_close_url=args.backend_close_url,
         gateway_tls=args.gateway_tls,
         harness_url=args.harness_url,
         harness_client_id=args.client_id,
@@ -2177,6 +2206,8 @@ def main() -> None:
     if args.force_measure:
         LOG.info("强制措施已开启: reject→funnel.stop+念提示, good→funnel.resume "
                  "(节流5s, chat TTS via wss://%s:%d)", _gw_host, _gw_port)
+    elif args.funnel and not args.no_reject:
+        LOG.info("静默质量筛选：不合格图片不送模型，仅记录判据；不自动暂停、不播报提示，语音控制仍可用")
 
     LOG.info("ESP32 Phase B input: ws://%s:%d/ws_audio_v2 + TCP:%d",
              args.esp32_host, args.esp32_port, args.image_tcp_port)
@@ -2186,7 +2217,6 @@ def main() -> None:
         LOG.info("[ROTATE] 摄像头顺时针 %d° 转正（进漏斗前）", args.rotate)
 
     async def _run() -> None:
-        await runtime.start()
         stop = asyncio.Event()
 
         def _sig(*_a):
@@ -2200,15 +2230,17 @@ def main() -> None:
                     signal.signal(s, _sig)
         except Exception:
             signal.signal(signal.SIGINT, _sig)
-        # 等"信号(Ctrl+C)"或"runtime 内部 stop_evt(rerun 图放完自动结束)"任一触发
-        _internal = getattr(runtime, "_stop_evt", None)
-        waiters = [asyncio.create_task(stop.wait())]
-        if _internal is not None:
-            waiters.append(asyncio.create_task(_internal.wait()))
-        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-        for w in waiters:
-            w.cancel()
-        await runtime.close()
+        waiters = []
+        try:
+            await runtime.start()
+            waiters = [asyncio.create_task(stop.wait()),
+                       asyncio.create_task(runtime._stop_evt.wait())]
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waiters:
+                task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+            await runtime.close()
 
     try:
         asyncio.run(_run())
