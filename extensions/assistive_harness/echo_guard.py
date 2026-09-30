@@ -53,7 +53,9 @@ class EchoGuard:
 
         best = 0.0
         for _, model_text in self._model_text:
-            if normalized in model_text or model_text in normalized:
+            # A model fragment inside a longer user command is not enough to
+            # discard the whole command (e.g. "色笔记本" + "帮我找手机").
+            if normalized in model_text:
                 best = 1.0
                 break
             best = max(best, SequenceMatcher(None, normalized, model_text).ratio())

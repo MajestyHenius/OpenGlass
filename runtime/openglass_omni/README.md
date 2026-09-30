@@ -1,128 +1,59 @@
 # OpenGlass Omni Runtime
 
-This directory holds OpenGlass's own control panel, the ESP32 audio/video bridge, the Rokid link, and the local session recording / replay code. The MiniCPM-o-Demo and llama.cpp-omni projects stay **external** — nothing here is copied into an upstream directory, and this panel never downloads, builds, or rewrites upstream config.
+[English setup](STARTUP_en.md) · [中文安装与使用](STARTUP_zh.md) · [Project overview](../../README.md)
 
-This is an experimental research integration. It is not production-ready, not a certified navigation aid, and not validated for unbounded-length sessions.
+This directory contains the panel, device startup helpers and local configuration. The panel launches llama.cpp-omni, MiniCPM-o-Demo worker/gateway, Harness and the selected device adapter.
 
-> For first-time setup (building llama.cpp-omni, downloading model weights, bringing up `worker.py` / `gateway.py`, flashing the ESP32), follow the **[top-level README](../../README.md)**. This page describes what lives in this directory and how it behaves once the upstream services are in place.
+## Launch
 
-## What's in here
+Prepare the shared backend and device using the setup guide, copy `runtime.example.json` to `runtime.local.json`, and enter local model/backend paths. From the OpenGlass root:
 
-| File | Role |
-| --- | --- |
-| `panel.py` | Control-panel logic: a process manager that starts/stops the launch chain, polls readiness, collects per-process logs, and hosts the pywebview window. |
-| `panel.html` | The panel UI (kept as a standalone file, like `templates/live.html`). Loaded by `panel.py` from the same directory. |
-| `esp32_bridge.py` | The host-side ESP32 duplex bridge: pulls camera JPEG + PDM audio from the glasses, streams to the gateway over `/v1/realtime`, plays back TTS, records the session, and serves the live first-person view. |
-| `rokid_minicpm_v8.py` | The Rokid link (APK connects in; no device selection). Shares the same worker/gateway front stages. |
-| `bridge_ui.py` | Local web server (default `http://localhost:8080`) for the live first-person view embedded in the panel, plus a `/replay` session browser. Without it, the panel's right pane is blank. |
-| `recorder_live.py` | Records every session to `sessions/` (video, user/AI audio tracks, `events.jsonl` subtitles, `meta.json`). |
-| `rerun_source.py` | Replays a recorded session back through the model (see [Rerun mode](#rerun-mode-command-line)). Not wired into the panel. |
-| `devices.json` | Glasses IP / rotation table. The panel's device dropdown follows this file. |
-| `templates/` | `live.html`, `replay.html`, `replay_index.html` — served by `bridge_ui.py`. |
-
-The entry point is the repository-root `glasses_panel.py`, an 8-line shim that calls `runtime.openglass_omni.panel:main`.
-
-## Process chain
-
-```text
-glasses_panel.py  (root shim → runtime.openglass_omni.panel:main)
-  └─ panel.py starts, in order:
-       1. llama-omni-server      (llama.cpp-omni build; C++ backend, port 22500)
-       2. MiniCPM-o-Demo/worker.py   (--backend-server-url http://127.0.0.1:22500, port 22400)
-       3. MiniCPM-o-Demo/gateway.py  (port 8006)
-       4. esp32_bridge.py  (or rokid_minicpm_v8.py)
-            ├─ ESP32 camera / audio input   (or Rokid APK)
-            ├─ local session recording (recorder_live.py) → sessions/
-            └─ local first-person web UI (bridge_ui.py, :8080)
-```
-
-The large model runs on the nearby host. The ESP32 only senses and streams. The panel launches the backend first, waits for its `/health` to return 200, then starts worker, gateway, and the bridge.
-
-## Running it
-
-Install both dependency sets into one environment (see the top-level README for details), then launch from the repository root:
-
-```bash
+```powershell
 python glasses_panel.py
 ```
 
-Pick a device and prompt, click **Start**, wait for four green indicators, and the right pane shows the glasses' first-person view.
-
-> **Use a named conda environment, not `base`.** The panel launches the bridge via `conda run -n <env> python esp32_bridge.py --prompt "..."`. With `base`, `conda run` can truncate a multi-line `--prompt`, so the system prompt is silently dropped and the model falls back to a generic default. A named environment avoids this. The bridge logs the prompt it actually received as `[PROMPT] len=… head=…` at startup — check that line if the model ignores your prompt.
-
-## Panel controls
-
-ESP32 modes: ① basic conversation; ② adds Harness voice controls without image
-filtering; ③ selects the best frame but sends it even if quality checks reject it;
-④ selects frames and silently withholds rejected images. Mode ④ keeps voice
-controls enabled, logs rejection reasons, and does not automatically pause the
-conversation or play rejection hints. It no longer requires rejection WAV files.
-The standalone runtime still supports `--force-measure` for explicit experiments;
-the panel does not enable it. Image filtering cannot guarantee hallucination-free
-responses: previous image context remains available to the model.
-
-| Control | Behavior |
+| Mode | Behavior |
 | --- | --- |
-| **Start (一键启动)** | Starts `llama-omni-server` → `worker` → `gateway` → `demo` in order, waiting for each to be ready. Uses the prompt currently shown in the panel. |
-| **Stop (停止)** | Gracefully stops only the bridge (so the session flushes to disk); backend/worker/gateway stay warm. |
-| **Start again** | After Stop, brings the bridge back up quickly (front stages still running). |
-| **Stop All (全部停止)** | Stops the bridge, harness (if used), gateway, worker, and llama backend; verifies owned child processes have exited and service ports are released. |
-| **Chain dropdown** | Switches between the **ESP32** and **Rokid** links; the front three stages are shared, only the fourth process differs. Rokid hides the device dropdown (the APK connects inbound). |
-| **Close window** | Runs Stop All. |
+| ESP32基础对话 | Basic multimodal conversation |
+| ESP32功能对话 | Harness controls and image selection, without rejection speech or automatic pausing |
+| Rokid功能对话 | Rokid input and Harness controls |
 
-The panel refuses to adopt a process that already occupies a target port but wasn't started by the panel, so it won't kill a service you launched by hand.
-
-On Windows each launched service is assigned to a Job Object. Stop All and window
-close allow the bridge up to 120 seconds to finish recordings, then forcibly end
-remaining owned processes and descendants. The OS also ends assigned processes
-if the panel exits abruptly (recording files may then be incomplete). A failed
-cleanup is logged and blocks restarting; the panel reports completion only after
-its process groups are empty and the checked service ports are free.
-
-For the Phase B realtime client, the panel passes `--backend-close-url` using the
-llama health endpoint's origin. Skill switches stop sending input and await
-`POST /sessions/{session_id}/close` with a matching successful completion response
-before creating the next session. The early WebSocket `session.closed` message
-alone is insufficient. A timeout or invalid response blocks automatic reuse and
-requires Stop All. When launching `esp32_runtime` manually against this backend,
-include `--backend-close-url http://127.0.0.1:22500` (adjust for your backend).
-This uses the existing backend HTTP interface; it does not modify model code.
-
-Control latency diagnostics: Harness logs include millisecond timestamps and
-`asr` / `event` IDs. Follow `recognized → decided → send` in the Harness log and
-`received → start → playback_blocked → done` in the runtime log. Harness also
-receives a completion summary and writes the per-stage durations to its run's
-`metrics.csv` and `session_events.jsonl`. `execution_ms` uses a monotonic clock;
-cross-process durations assume the services share the PC clock. `playback_blocked`
-means the software playback queue was blocked and flushed, not a measurement of
-the last audible sample. Failed/ignored/cancelled operations are labeled separately.
-The panel refreshes every 250 ms, with at most one status request in flight.
+Rokid Android source and build/install scripts are in [rokid_app](../../rokid_app/README.md). Install the app once; the panel supplies the configured PC address at launch. USB bootstraps wireless ADB on first use or after the glasses reset debugging/network state.
 
 ## Configuration
 
-Edit the `CONFIG` dict at the top of `panel.py`, plus `devices.json`. See the top-level README's Configuration table for the full list; the entries specific to this module:
-
-| What | Where |
+| File | Purpose |
 | --- | --- |
-| Backend `.exe` + model `.gguf` paths | `procs["llama"]` in `panel.py` (`<PATH_TO>` placeholders — must edit) |
-| Glasses IP / rotation | `devices.json` (one entry per pair; the dropdown follows it) |
-| Conda environment | `conda_env` (use a **named** env, not `base`) |
-| Worker ready port | `worker_ready_port` (must match your `worker.py` port; default `22400`) |
-| MiniCPM-o-Demo directory | `minicpm_demo_dir` (absolute path to your MiniCPM-o-Demo clone; worker/gateway start there) |
-| Working directory | `cwd` (optional; only affects llama/demo/rokid, which use absolute paths — normally empty) |
+| `runtime.local.json` | Backend/model paths, environment and Rokid device settings |
+| `devices.json` | ESP32 IP, name and rotation |
+| `voice_commands.local.yaml` | Harness activation phrases; copy `voice_commands.example.yaml` |
+| `panel.py` / `CONFIG["presets"]` | Panel chat prompts |
+| `../../extensions/assistive_harness/prompts/` | Skill prompts |
 
-Model weights, backend paths, and the C++ config live in the **upstream** MiniCPM-o-Demo / llama.cpp-omni projects. The panel only launches and supervises processes and shows the first-person view — it does not read or validate upstream model configuration.
+Restart the panel after local configuration changes. Reactivate a skill after editing its prompt. The selected Rokid panel prompt overrides the idle-chat prompt file.
 
-## Session recording and replay
+## Runtime files
 
-Every session is written to `sessions/<timestamp>/` by `recorder_live.py`: the composed video, separate user/AI audio tracks, `events.jsonl` (subtitles/events), and `meta.json`. `bridge_ui.py` serves:
+| File or module | Purpose |
+| --- | --- |
+| `panel.py`, `panel.html` | Process control and panel UI |
+| `process_job.py` | Windows child-process ownership |
+| `rokid_device.py` | ADB selection, Wi-Fi recovery and collector launch |
+| `esp32_bridge.py` | ESP32 bridge entry |
+| `extensions.assistive_harness.phase_b.rokid_panel_runtime` | Rokid sensor ingress, Harness and live view |
+| `extensions.assistive_harness.phase_b.recorder_live` | Functional-route recording/export |
 
-- `http://localhost:8080/` — the live first-person view (also embedded in the panel).
-- `http://localhost:8080/replay` — a browser of past sessions with video + synced subtitles.
+Default ports: backend 22500, worker 22400, gateway 8006, Harness 8021, live view 8080 and Rokid sensor input 18080.
 
-You can also run `bridge_ui.py` standalone as a replay-only server (no glasses, no model):
+## Recording and replay
 
-```bash
+Rokid supports `--record-live` with `--ui-port 8080`. It writes `live_sessions/rokid_<timestamp>/`; use `--live-record-dir` to change the parent directory. Normal stop saves separate user/model WAV files, shuts down services and exports `live_session.mp4`. FFmpeg must be on PATH for video export. The two audio channels carry user/model audio.
+
+Use the stop button and wait for export. Audio remains buffered until stop, so force-killing the process can lose it. The live UI is `http://localhost:8080/`; the corresponding running UI serves `/replay` for its recording directory.
+
+The legacy ESP32 recorder uses `sessions/`. Its replay-only server can be launched separately:
+
+```powershell
 python runtime/openglass_omni/bridge_ui.py --sessions sessions --port 8080
 ```
 
@@ -148,11 +79,3 @@ Notes:
 - **Requires `sounddevice`**: rerun plays the recorded user audio through a separate output stream. Any machine that can run a live session already has it.
 
 Watch the rerun via the bridge's own live view at `http://localhost:<ui-port>/`.
-
-## Current boundaries
-
-- The panel starts and supervises processes and shows the first-person view; it does not own model weights, backend paths, or upstream configuration.
-- `worker.py` / `gateway.py` and the model weights come from external upstream projects and are not vendored here.
-- The Rokid link is included, but its gateway protocol may differ from the ESP32 link depending on your build; treat the ESP32 link as the primary supported path.
-- One-click rerun from within the panel is not implemented; rerun is the command-line workflow above.
-- Session output under `sessions/` may contain faces, surroundings, voices, and device addresses. Review it before sharing or publishing.

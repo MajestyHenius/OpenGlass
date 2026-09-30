@@ -27,9 +27,7 @@ with a Python device adapter.
 
 System prompts live in `extensions/assistive_harness/prompts/`. Existing prompt
 files are read on every activation, so users can replace a prompt and activate
-the Skill again without restarting the sidecar. Skill IDs, enable flags and
-voice phrases are configured in `config/skills.example.yaml`; changing that YAML
-does require restarting the sidecar.
+the Skill again without restarting the sidecar. Voice phrases are configured in `runtime/openglass_omni/voice_commands.local.yaml` (copy its example). Skill IDs, enable flags and prompt mappings are in `config/skills.example.yaml`. Restart the sidecar after changing either YAML file.
 
 Enabled by default:
 
@@ -58,3 +56,9 @@ remain outside the audio/control receive path.
 the `noop` provider until a task-specific plugin is registered. Provider setup,
 the observation schema, and an OCR implementation template are documented in
 [`cv/README.md`](cv/README.md).
+
+## Rokid panel integration / Rokid 面板接入
+
+See [English setup](../../runtime/openglass_omni/STARTUP_en.md) and [中文说明](../../runtime/openglass_omni/STARTUP_zh.md) for APK installation, wireless startup, recording and prompt editing. The panel route uses gateway 8006 `/v1/realtime` and Harness 8021; the older 8040 example above is a separate entry.
+
+技能提示词在 `prompts/`，触发词在 `runtime/openglass_omni/voice_commands.local.yaml`；两者不同。面板普通聊天的 `--prompt` 优先于 `idle_chat_zh.txt`。重新激活技能或创建会话后使用新提示词。

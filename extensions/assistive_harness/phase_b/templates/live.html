@@ -398,7 +398,8 @@ function updateHealth(e) {
   // 2) 本 chunk 是否送图给模型
   const sent = $('hSent');
   sent.classList.remove('good','warn','bad');
-  if (e.img_sent) { sent.classList.add('good'); $('hSentText').textContent = '送图 ✓'; }
+  if (e.preview_only) { $('hSentText').textContent = '实时预览'; }
+  else if (e.img_sent) { sent.classList.add('good'); $('hSentText').textContent = '送图 ✓'; }
   else {
     // 没送模型：可能是被漏斗拦下（带 reject_reason），也可能只是同一轮里
     // 非 best 的那几帧。画面照样刷新，这样第一视角才连续、也看得见被拦的图。

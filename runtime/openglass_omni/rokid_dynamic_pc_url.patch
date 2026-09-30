@@ -1,0 +1,42 @@
+--- a/app/src/main/java/org/opensqz/openglass/rokid/MainActivity.kt
++++ b/app/src/main/java/org/opensqz/openglass/rokid/MainActivity.kt
+@@ -66,0 +67,21 @@
++    private var pcBaseUrl = BuildConfig.PC_BASE_URL
++    private var pcWsUrl = BuildConfig.PC_WS_URL
++
++    private fun configurePcAddress() {
++        val prefs = getSharedPreferences("pc_connection", Context.MODE_PRIVATE)
++        val supplied = intent.getStringExtra("pc_base_url")
++        val candidate = supplied ?: prefs.getString("pc_base_url", BuildConfig.PC_BASE_URL)!!
++        try {
++            val uri = java.net.URI(candidate.trim().trimEnd('/'))
++            require(uri.scheme == "http" && !uri.host.isNullOrBlank()
++                && uri.rawUserInfo == null && uri.rawQuery == null && uri.rawFragment == null
++                && uri.rawPath.isNullOrEmpty() && (uri.port == -1 || uri.port in 1..65535))
++            pcBaseUrl = uri.toString()
++            pcWsUrl = "ws://${uri.rawAuthority}/rokid/audio"
++            if (supplied != null) prefs.edit().putString("pc_base_url", pcBaseUrl).apply()
++            Log.i(TAG, "PC_CONFIG applied pcBase=$pcBaseUrl pcWs=$pcWsUrl")
++        } catch (e: Exception) {
++            Log.e(TAG, "Invalid PC address; keeping built-in default", e)
++        }
++    }
++
+@@ -115,0 +137 @@
++        configurePcAddress()
+@@ -128 +150 @@
+-        Log.i(TAG, "onCreate pcBase=${BuildConfig.PC_BASE_URL} pcWs=${BuildConfig.PC_WS_URL}")
++        Log.i(TAG, "onCreate pcBase=$pcBaseUrl pcWs=$pcWsUrl")
+@@ -294 +316 @@
+-        listOf(BuildConfig.PC_BASE_URL, USB_REVERSE_BASE_URL).distinct()
++        listOf(pcBaseUrl, USB_REVERSE_BASE_URL).distinct()
+@@ -297 +319 @@
+-        listOf(BuildConfig.PC_WS_URL, USB_REVERSE_WS_URL).distinct()
++        listOf(pcWsUrl, USB_REVERSE_WS_URL).distinct()
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -14,2 +14,2 @@
+-        versionCode 3
+-        versionName '0.1.2'
++        versionCode 4
++        versionName '0.1.3'

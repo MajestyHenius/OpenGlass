@@ -6,21 +6,21 @@ SmartGlasses 现场演示控制面板 —— ALL（双链路版）
 在 glasses_panel_new.py 基础上，把 Rokid 链路也并进来。两条链路二选一：
 
   ESP32 链: llama -> worker -> gateway -> demo_esp32_duplex_0703.py
-  Rokid 链: llama -> worker -> gateway -> rokid_minicpm_v8.py
+  Rokid 链: llama -> worker -> gateway -> harness -> rokid_runtime
 
 前三级共用，只有第四级不同。顶部「链路」下拉切换，切换即换状态灯/日志页签/
 第一视角地址；Rokid 分支自动隐藏「眼镜」下拉（它是 APK 反向连进来，没有选镜这回事）。
 
-★ Rokid 必须用 v8：v7 是旧协议(/ws/duplex + prepare)，连不上新 gateway(8006, V2)。
+★ Rokid 使用 Phase B 接入模块与 /v1/realtime 协议。
 ★ run_rokid.ps1 / run_rokid_wifi.cmd 已不需要——建目录、设环境变量、拼参数、
   USB 下 adb reverse + 拉起 APK，全部内联进本面板（见 _rokid_pre_launch /
-  _rokid_env / _rokid_post_launch）。把 rokid_minicpm_v8.py 放在本面板同级目录即可。
+  _rokid_env / _rokid_post_launch）。Rokid 使用仓库内的 Phase B 接入模块。
 
 旧的 glasses_panel_new.py 保持原样不动：这条路线万一现场坏了，ESP32 链路还有退路。
 
-运行：  python glasses_panel_all.py
+运行：  python glasses_panel.py
 依赖：  pip install pywebview
-只需修改下面的 CONFIG 区块即可，其余无需改动。
+本机路径、网络和无线 adb 地址放在 runtime.local.json，见 README.md。
 """
 
 import json
@@ -97,10 +97,15 @@ CONFIG = {
     "rokid_fpv_url": "http://localhost:8080",
     "rokid_save_root": "sessions",
     "rokid_log_dir": "logs",
-    # USB 模式才需要 adb reverse + 拉起 APK；WiFi 模式不需要 adb。
+    # 两种模式都走 adb reverse + APK 拉起：
+    #   usb  = 每次都要接 USB
+    #   wifi = 首次接一次 USB 让 RokidDevice 自动 `adb tcpip 5555` + `adb connect`
+    #          并把 <ip>:5555 存到 runtime.local.json 的 rokid_adb_addr；
+    #          之后就不再需要 USB（眼镜不断电、IP 不变即可）。
     "rokid_mode": "wifi",                      # "wifi" | "usb"
-    "rokid_enable_funasr": False,              # True = 加 --enable-funasr（需装 funasr 包）
-    "rokid_adb": "adb",                        # USB 模式下的 adb 路径
+    "rokid_adb_tcpip_port": 5555,              # 首次 USB 授权时 adb tcpip 的端口
+    "rokid_enable_funasr": False,              # 兼容旧配置；ASR 统一由 Harness 提供
+    "rokid_adb": "adb",                        # adb 可执行路径（wifi 模式也用）
     "rokid_package": "org.opensqz.openglass.rokid.debug",
     "rokid_activity": "org.opensqz.openglass.rokid.debug/org.opensqz.openglass.rokid.MainActivity",
 
@@ -120,7 +125,7 @@ CONFIG = {
             r"<PATH_TO>\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
             #"-m", r"<PATH_TO>\MiniCPM-o-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             # e.g.
-            "-m", r"<PATH_TO>\MiniCPM-o-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
+            "-m", r"<PATH_TO>\MiniCPM-o-4-5-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             "-ngl", "99",
             "--host", "127.0.0.1",
             "--port", "22500",
@@ -211,32 +216,19 @@ CONFIG = {
 
         # ⑦ rokid bridge —— 与 demo 平行、二选一的“第四个进程”。
         #    注意：它不是客户端去连眼镜，而是在 PC 上开 18080 端口等 APK 连进来。
-        #    ★ 用 v8（API V2）。v7 是旧协议(/ws/duplex)，连不上新 gateway:8006。
+        #    使用 Phase B + RealtimeDuplexSession 接入 V2 gateway:8006。
         #    ★ run_rokid.ps1 / run_rokid_wifi.cmd 已不再需要——它们做的事
         #      （建目录、设环境变量、拼参数、USB 下 adb reverse + 拉起 APK）
         #      全部内联到本面板里了，见 _rokid_pre_launch() 与 _spawn()。
         "rokid": [
-            "python", "{here}/rokid_minicpm_v8.py",
-            "--host", "0.0.0.0",
-            "--port", "18080",
-            # v8 默认已是 ws + 8006，这里显式写出，方便现场改
-            "--gateway", "localhost:8006",
-            #"--no-gateway-tls",
-            "--gateway-tls",
-            "--save-session",
-            "--save-root", "sessions",
-            "--image-enhance", "auto",
-            "--image-rotate-cw", "270",
-            "--log-level", "INFO",
-            # live.html 观测页（与 ESP32 demo 同一套 bridge_ui 前端/模板）
-            "--ui-port", "8080",
+            "python", "-m", "extensions.assistive_harness.phase_b.rokid_panel_runtime",
+            "--host", "0.0.0.0", "--port", "18080",
+            "--gateway", "localhost:8006", "--gateway-tls",
+            "--gateway-proto", "realtime",
+            "--harness-url", "wss://127.0.0.1:8021/ws/control",
+            "--image-rotate-cw", "270", "--ui-port", "8080",
             "--prompt", "{prompt}",
-            # ★ 眼镜连的 WiFi。**不要把真实密码提交进仓库** ——
-            #   在 panel.py 同目录放一个 panel.local.json（已在 .gitignore）：
-            #     { "glasses_ssid": "你的WiFi", "glasses_psk": "你的密码" }
-            #   没有该文件时用下面的占位值，Rokid 链路会连不上 WiFi 但其余功能正常。
-            "--glasses-ssid", "{glasses_ssid}",
-            "--glasses-psk", "{glasses_psk}",
+            "--record-live",
         ],
     },
 
@@ -246,7 +238,7 @@ CONFIG = {
     #   rokid → rokid_minicpm_v7.py      （PC 开端口等 APK 连进来，无 device）
     "chains": {
         "esp32": {
-            "label": "① 基础对话",
+            "label": "ESP32基础对话",
             "tail": "demo",                      # 第四级进程名
             "start_order": ["llama", "worker", "gateway", "demo"],
             "stop_order":  ["demo", "gateway", "worker", "llama"],
@@ -263,6 +255,7 @@ CONFIG = {
         #     对焦后那张未必赶得上这一轮，等于花了时间没用上。）
         "esp32_voice": {
             "label": "② 语音控制",
+            "hidden": True,
             "tail": "demo_funnel",
             "funnel": 0,                         # 漏斗档位：0 关 / 2 选图 / 3 选图+拒绝
             "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
@@ -272,6 +265,7 @@ CONFIG = {
         },
         "esp32_select": {
             "label": "③ 质量筛选",
+            "hidden": True,
             "tail": "demo_funnel",
             "funnel": 2,
             "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
@@ -280,7 +274,7 @@ CONFIG = {
             "fpv_key": "fpv_url",
         },
         "esp32_full": {
-            "label": "④ 完整防幻觉",
+            "label": "ESP32功能对话",
             "tail": "demo_funnel",
             "funnel": 3,
             "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
@@ -289,10 +283,10 @@ CONFIG = {
             "fpv_key": "fpv_url",
         },
         "rokid": {
-            "label": "Rokid 眼镜",
+            "label": "Rokid功能对话",
             "tail": "rokid",
-            "start_order": ["llama", "worker", "gateway", "rokid"],
-            "stop_order":  ["rokid", "gateway", "worker", "llama"],
+            "start_order": ["llama", "worker", "gateway", "harness", "rokid"],
+            "stop_order":  ["rokid", "harness", "gateway", "worker", "llama"],
             "need_device": False,                # bridge 不需要眼镜 IP
             "fpv_key": "rokid_fpv_url",
         },
@@ -429,6 +423,9 @@ def _load_runtime_local():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     f = os.path.join(here, "runtime.local.json")
+    # 无论文件存不存在，都把路径暴露出去 —— RokidDevice 首次成功建立无线 ADB
+    # 后要写回 rokid_adb_addr；文件缺失时它会创建新文件。
+    CONFIG["runtime_local_path"] = f
     if not os.path.isfile(f):
         print(f"[panel] 未找到 {f}")
         print("[panel]   请复制 runtime.example.json 为 runtime.local.json 并填写本机路径；")
@@ -446,8 +443,14 @@ def _load_runtime_local():
 
     n = 0
     # ① 简单键 -> CONFIG 顶层
+    #    rokid_adb_addr 是 RokidDevice 首次通过 USB 建立无线调试后自己写回来的
+    #    （形如 "GLASSES_IP:5555"）。手动填也行，但一般用不到。
     for src_key, dst_key in (("conda_env", "conda_env"),
-                             ("minicpm_demo_root", "minicpm_demo_dir")):
+                             ("minicpm_demo_root", "minicpm_demo_dir"),
+                             ("rokid_mode", "rokid_mode"), ("rokid_adb", "rokid_adb"),
+                             ("rokid_serial", "rokid_serial"), ("rokid_pc_url", "rokid_pc_url"),
+                             ("rokid_adb_addr", "rokid_adb_addr"),
+                             ("rokid_adb_tcpip_port", "rokid_adb_tcpip_port")):
         v = _expand(cfg.get(src_key))
         if v:
             CONFIG[dst_key] = v
@@ -670,14 +673,10 @@ class ProcManager:
             backend = urlsplit(self.cfg["llama_health_url"])
             cmd += ["--backend-close-url", f"{backend.scheme}://{backend.netloc}"]
         elif name == "rokid":
-            _loc = self.cfg.get("local", {})
-            subst = {
-                "{prompt}": self.current_prompt,
-                "{glasses_ssid}": _loc.get("glasses_ssid", ""),
-                "{glasses_psk}": _loc.get("glasses_psk", ""),
-            }
-            cmd = [subst.get(x, x) for x in cmd]
-            cmd += self._rokid_extra_args()   # 内联 ps1 的 --enable-funasr 分支
+            cmd = [self.current_prompt if x == "{prompt}" else x for x in cmd]
+            from urllib.parse import urlsplit
+            backend = urlsplit(self.cfg["llama_health_url"])
+            cmd += ["--backend-close-url", f"{backend.scheme}://{backend.netloc}"]
         return self._wrap_conda(cmd)
 
     # ---- 日志 ----
@@ -770,21 +769,8 @@ class ProcManager:
     #   4) USB 模式：adb reverse tcp:18080 + 唤醒并拉起眼镜 APK
     #   5) WiFi 模式：不碰 adb，只打印本机 IPv4 供你核对 APK 里编进去的 IP
     def _rokid_env(self):
-        """Rokid 专属环境变量（对应 ps1 里的 $env: 那几行）。"""
-        env = {}
-        log_dir = self.cfg.get("rokid_log_dir", "logs")
-        save_root = self.cfg.get("rokid_save_root", "sessions")
-        for d in (log_dir, save_root):
-            try:
-                os.makedirs(d, exist_ok=True)
-            except Exception as e:
-                self._log("rokid", f"!! 建目录失败 {d}: {e}")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        mode = self.cfg.get("rokid_mode", "wifi")
-        env["ROKID_V7_LOG_FILE"] = os.path.join(log_dir, f"rokid_{mode}_{stamp}.log")
-        env["PYTHONUNBUFFERED"] = "1"
-        self._log("rokid", f"日志: {env['ROKID_V7_LOG_FILE']}")
-        return env
+        # stdout/stderr are already captured in the panel's per-process log.
+        return {"PYTHONUNBUFFERED": "1"}
 
     def _device_args(self):
         """从 devices.json 取当前眼镜的 IP / 端口 / 旋转角，填给 esp32_runtime。"""
@@ -825,7 +811,7 @@ class ProcManager:
         lv = int(self.chain().get("funnel", 0))
         need = [("aiohttp", "aiohttp"), ("numpy", "numpy"),
                 ("PIL", "Pillow"), ("sounddevice", "sounddevice")]
-        if self.chain().get("tail") == "demo_funnel":
+        if self.chain().get("tail") in ("demo_funnel", "rokid"):
             need += [("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
                      ("yaml", "PyYAML"), ("funasr", "funasr")]
         if lv >= 2:
@@ -850,10 +836,10 @@ class ProcManager:
         缺文件时子进程会起来立刻死、日志里一行 No module named extensions，
         面板上只看到灯变红，所以提前拦住并说清楚。
         """
-        if self.chain().get("tail") != "demo_funnel":
+        if self.chain().get("tail") not in ("demo_funnel", "rokid"):
             return True
         f = os.path.join(self._repo_root(), "extensions", "assistive_harness",
-                         "phase_b", "esp32_runtime.py")
+                         "phase_b", "rokid_runtime.py" if self.chain().get("tail") == "rokid" else "esp32_runtime.py")
         if not os.path.isfile(f):
             self._log("demo_funnel",
                       f"!! 未找到 {f}\n"
@@ -906,60 +892,86 @@ class ProcManager:
             pass
         return out
 
+    # ------------------------------------------------------------------ helpers
+    def _preflight_firewall(self, port: int) -> None:
+        """放行 port 入站。已存在同名规则则跳过。仅 Windows。
+        非管理员时先直连 netsh 试一次，失败再走一次 UAC 提权（一次同意后规则永久保留，
+        以后启动 panel 不再弹）。这是 v8 里说的"防火墙默认挡 18080 入站 → curl timeout"
+        那件事，眼镜 SYN 被 Windows 直接吃掉，rokid 端根本看不到，因此必须做。"""
+        if os.name != "nt":
+            return
+        rule = f"RokidBridge{port}"
+        try:
+            p = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+        except Exception:
+            rc, out = 1, ""
+        if rc == 0 and rule in out:
+            self._log("rokid", f"[PRE] 防火墙规则已存在: {rule}")
+            return
+        self._log("rokid", f"[PRE] 添加防火墙规则 {rule} (TCP {port})…")
+        add_args = ("advfirewall firewall add rule "
+                    f"name={rule} dir=in action=allow protocol=TCP localport={port}")
+        # 先按当前权限尝试
+        try:
+            p = subprocess.run(
+                ["netsh"] + add_args.split(),
+                capture_output=True, text=True, timeout=15,
+            )
+            if p.returncode == 0:
+                self._log("rokid", f"[PRE] 防火墙已放行 TCP {port}")
+                return
+            self._log("rokid", f"[PRE] 非管理员放行失败 (rc={p.returncode})，尝试 UAC 提权…")
+        except Exception as e:
+            self._log("rokid", f"[PRE] netsh 直连异常: {e}，尝试 UAC 提权…")
+
+        # 提权路径：PowerShell Start-Process -Verb RunAs 弹一次 UAC；
+        # 用户点是后规则永久保留，之后每次启动都命中"已存在"直接跳过。
+        try:
+            ps_cmd = (
+                f"$p = Start-Process -FilePath netsh -ArgumentList '{add_args}' "
+                "-Verb RunAs -WindowStyle Hidden -PassThru -Wait; "
+                "exit $p.ExitCode"
+            )
+            p = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=60,
+            )
+            if p.returncode == 0:
+                self._log("rokid", f"[PRE] 防火墙已放行 TCP {port}（经 UAC 提权）")
+            else:
+                err = (p.stderr or p.stdout or "").strip()
+                self._log("rokid", f"[PRE] !! UAC 提权添加失败 rc={p.returncode}: {err or '(可能被拒绝)'}")
+                self._log("rokid", "[PRE] !! 眼镜的 TCP SYN 可能被 Windows 防火墙丢弃，"
+                                    "rokid 端不会看到任何请求。请重跑 panel 并在 UAC 弹窗点"
+                                    "\"是\"，或以管理员身份启动 panel。")
+        except Exception as e:
+            self._log("rokid", f"[PRE] !! UAC 提权命令异常: {e}")
+
     def _rokid_pre_launch(self):
-        """起 bridge 之前该做的事。USB 才用 adb；WiFi 只提示 IP。"""
-        mode = self.cfg.get("rokid_mode", "wifi")
-        port = int(self.cfg.get("rokid_port", 18080))
-        if mode == "usb":
-            adb = self.cfg.get("rokid_adb", "adb")
-            self._log("rokid", f"USB 模式：adb reverse tcp:{port}")
-            try:
-                subprocess.run([adb, "reverse", "--remove", f"tcp:{port}"],
-                               capture_output=True, timeout=10)
-                r = subprocess.run([adb, "reverse", f"tcp:{port}", f"tcp:{port}"],
-                                   capture_output=True, text=True, timeout=10)
-                if r.returncode != 0:
-                    self._log("rokid", f"!! adb reverse 失败: {r.stderr.strip()}")
-            except FileNotFoundError:
-                self._log("rokid", f"!! 找不到 adb（{adb}），USB 模式无法转发端口")
-            except Exception as e:
-                self._log("rokid", f"!! adb reverse 异常: {e}")
-        else:
-            ips = self._local_ipv4s()
-            self._log("rokid", f"WiFi 模式：本机 IPv4 = {', '.join(ips) if ips else '未探测到'}")
-            self._log("rokid", "注意：眼镜 APK 里的 PC IP 是编译期常量，必须与上面某个 IP 一致")
+        from runtime.openglass_omni.rokid_device import RokidDevice
+        self._rokid_device = RokidDevice(self.cfg, lambda msg: self._log("rokid", msg))
+        try:
+            if self.cfg.get("rokid_mode", "wifi") == "wifi":
+                self._preflight_firewall(int(self.cfg.get("rokid_port", 18080)))
+            self._rokid_device.prepare()
+        except Exception as exc:
+            self._log("rokid", f"[PRE] {exc}; PC 接收服务仍会启动")
 
     def _rokid_post_launch(self):
-        """bridge 就绪后拉起眼镜 APK（仅 USB；WiFi 下眼镜自己会连进来）。
-        对应 ps1 里的 Start-RokidLaunchJob。"""
-        if self.cfg.get("rokid_mode", "wifi") != "usb":
+        device = getattr(self, "_rokid_device", None)
+        if device is None or not device.prefix or len(device.prefix) < 3:
+            self._log("rokid", "[PRE] 未选定眼镜，跳过设备启动")
             return
-        adb = self.cfg.get("rokid_adb", "adb")
-        pkg = self.cfg.get("rokid_package", "")
-        act = self.cfg.get("rokid_activity", "")
-
         def run():
             try:
-                subprocess.run([adb, "shell", "am", "force-stop", pkg],
-                               capture_output=True, timeout=10)
-                subprocess.run([adb, "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
-                               capture_output=True, timeout=10)
-                subprocess.run([adb, "shell", "wm", "dismiss-keyguard"],
-                               capture_output=True, timeout=10)
-                time.sleep(1.0)
-                self._log("rokid", "拉起眼镜采集 APK…")
-                r = subprocess.run([adb, "shell", "am", "start", "-S", "-W", "-n", act],
-                                   capture_output=True, text=True, timeout=20)
-                if r.returncode != 0:
-                    subprocess.run([adb, "shell", "monkey", "-p", pkg, "-c",
-                                    "android.intent.category.LAUNCHER", "1"],
-                                   capture_output=True, timeout=20)
-                self._log("rokid", "APK 已拉起，等待它连入 18080")
-            except FileNotFoundError:
-                self._log("rokid", f"!! 找不到 adb（{adb}），无法自动拉起 APK")
-            except Exception as e:
-                self._log("rokid", f"!! 拉起 APK 失败: {e}")
-
+                device.launch()
+            except Exception as exc:
+                self._log("rokid", f"[PRE] {exc}")
         threading.Thread(target=run, daemon=True).start()
 
     # ---- 起停单个进程 ----
@@ -987,7 +999,7 @@ class ProcManager:
         #     paddle 导入失败（partially initialized module 'paddle' ...
         #     circular import）→ 方向分类器加载失败 → 回退到错误的早期 CV 判据
         #     → 第一轮就误报 orient_flipped，然后播报拉长帧间隔又误报 severe_shake。
-        if name in ("harness", "demo_funnel"):
+        if name in ("harness", "demo_funnel", "rokid"):
             _cwd = self._repo_root()
         elif name in ("worker", "gateway"):
             _cwd = self.cfg.get("minicpm_demo_dir") or self.cfg.get("cwd") or None
@@ -1213,7 +1225,9 @@ class ProcManager:
             ready = data.get("ok") and data.get("enabled") and data.get("asr_loaded")
             return bool(ready), f"harness health={data}"
         if name == "rokid":
-            return self._http_ok(self.cfg["rokid_health_url"]), "rokid /health"
+            data = self._http_get_json(self.cfg["rokid_health_url"]) or {}
+            ready = data.get("harness_connected") and data.get("gateway_status") == "running"
+            return bool(ready), f"rokid harness={data.get('harness_connected')} gateway={data.get('gateway_status')}"
         event = self._ready_events.get(name)
         return bool(event and event.is_set()), "waiting for model session ready"
 
@@ -1585,6 +1599,8 @@ class Api:
         # 每条链路把自己的 fpv 地址/是否要选眼镜一并给前端，前端切链即切界面
         chains = {}
         for k, c in self.cfg["chains"].items():
+            if c.get("hidden", False):
+                continue
             chains[k] = {
                 "label": c["label"],
                 "need_device": c["need_device"],

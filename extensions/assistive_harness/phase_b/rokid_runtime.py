@@ -46,6 +46,7 @@ class CtrlCExitWatchdog:
         self.hard_exit_s = max(1.0, float(hard_exit_s))
         self._armed = False
         self._lock = threading.Lock()
+        self._finished = threading.Event()
 
     @property
     def armed(self) -> bool:
@@ -68,7 +69,8 @@ class CtrlCExitWatchdog:
         ).start()
 
     def _force_exit_after_deadline(self) -> None:
-        time.sleep(self.hard_exit_s)
+        if self._finished.wait(self.hard_exit_s):
+            return
         LOG.error(
             "Rokid shutdown exceeded %.1fs; forcing process exit so port 18080 "
             "cannot remain occupied",
@@ -76,6 +78,9 @@ class CtrlCExitWatchdog:
         )
         logging.shutdown()
         os._exit(130)
+
+    def disarm(self) -> None:
+        self._finished.set()
 
 
 def pcm16le_to_float32(raw: bytes) -> np.ndarray:
@@ -312,6 +317,8 @@ class PCSpeaker:
         )
         stream.start()
         self._stream = stream
+        LOG.info("PC audio output device=%s name=%s", stream.device,
+                 sd.query_devices(stream.device).get("name", "unknown"))
 
     def _close_stream(self) -> None:
         stream = self._stream
@@ -441,6 +448,7 @@ class RokidRuntimeConfig:
     prepare_timeout_s: float = 120.0
     close_timeout_s: float = 10.0
     backend_close_url: str = ""
+    idle_prompt: str = ""
     reconnect_s: float = 1.5
     play_audio: bool = True
     session_ready_chime: bool = True
@@ -859,7 +867,8 @@ class GatewaySessionManager:
             generation=self.gate.generation,
             skill_id=skill_id,
             slots=dict(slots),
-            system_prompt=system_prompt or rendered.text,
+            system_prompt=(self.config.idle_prompt if skill_id == self.registry.default_skill
+                           and self.config.idle_prompt else system_prompt or rendered.text),
         )
 
     async def start_initial(self) -> None:
@@ -1295,12 +1304,18 @@ class HarnessClient:
     # 不改构造签名，赋值即可：client.on_message = fn
     on_message = None
 
+    def _ssl_context(self):
+        # The panel uses a self-signed certificate on the local Harness only.
+        from urllib.parse import urlsplit
+        url = urlsplit(self.url)
+        return False if url.scheme == "wss" and url.hostname in {"127.0.0.1", "localhost", "::1"} else True
+
     async def run(self) -> None:
         while not self._stop.is_set():
             try:
                 async with aiohttp.ClientSession() as client:
                     async with client.ws_connect(
-                        self.url, heartbeat=30, max_msg_size=0
+                        self.url, heartbeat=30, max_msg_size=0, ssl=self._ssl_context()
                     ) as ws:
                         self.ws = ws
                         self.connected = True
@@ -1351,13 +1366,16 @@ class HarnessClient:
             if self.ws is not None and not self.ws.closed:
                 await self.ws.send_json(payload)
 
-    async def send_audio(self, samples: np.ndarray) -> None:
+    async def send_audio(self, samples: np.ndarray, *, started_at_ms: float | None = None,
+                         discontinuity: bool = False) -> None:
         if samples.size == 0:
             return
         await self.send(
             {
                 "type": "audio.mirror",
-                "started_at_ms": now_ms() - samples.size * 1000.0 / SAMPLE_RATE_IN,
+                "started_at_ms": (started_at_ms if started_at_ms is not None
+                                  else now_ms() - samples.size * 1000.0 / SAMPLE_RATE_IN),
+                "discontinuity": discontinuity,
                 "sample_rate": SAMPLE_RATE_IN,
                 "audio_b64": float32_to_base64(samples),
             }
@@ -1408,6 +1426,7 @@ class PhaseBRokidRuntime:
     ):
         self.config = config
         self.registry = SkillRegistry(config.skills_config)
+        self.live_rec = None
         self.audio_queue = DropOldestAudioQueue(config.audio_queue_packets)
         self.audio_mirror = AudioMirrorChunker()
         self.latest_frame = LatestFrame()
@@ -1432,6 +1451,7 @@ class PhaseBRokidRuntime:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._no_input_warning_emitted = False
+        self._audio_sockets = set()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -1619,8 +1639,11 @@ class PhaseBRokidRuntime:
         async def rokid_audio(request: web.Request) -> web.WebSocketResponse:
             ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
             await ws.prepare(request)
+            self._audio_sockets.add(ws)
             self.stats.audio_clients += 1
             LOG.info("[ROKID] audio connected from %s", request.remote)
+            self.audio_mirror.clear()
+            first_mirror = True
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.BINARY:
@@ -1630,6 +1653,9 @@ class PhaseBRokidRuntime:
                         if len(raw) % PCM16_WIDTH:
                             raw = raw[:-1]
                         self.stats.audio_packets += 1
+                        if self.live_rec is not None:
+                            self.live_rec.feed_user_raw(
+                                np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0)
                         self.stats.audio_bytes += len(raw)
                         self.stats.last_audio_ms = now_ms()
                         if self.stats.audio_packets == 1:
@@ -1647,10 +1673,12 @@ class PhaseBRokidRuntime:
                             amplified = apply_pcm16_gain(raw, self.config.input_gain)
                             self.audio_queue.put_nowait(amplified)
                             for frame in self.audio_mirror.feed(amplified):
-                                await self.harness.send_audio(frame)
+                                await self.harness.send_audio(frame, discontinuity=first_mirror)
+                                first_mirror = False
                     elif message.type == aiohttp.WSMsgType.ERROR:
                         break
             finally:
+                self._audio_sockets.discard(ws)
                 self.stats.audio_clients = max(0, self.stats.audio_clients - 1)
                 LOG.info("[ROKID] audio disconnected from %s", request.remote)
             return ws
@@ -1661,12 +1689,16 @@ class PhaseBRokidRuntime:
         async def on_cleanup(_app: web.Application) -> None:
             await self.close()
 
+        async def on_shutdown(_app: web.Application) -> None:
+            await asyncio.gather(*(ws.close() for ws in tuple(self._audio_sockets)))
+
         app.router.add_get("/", health)
         app.router.add_get("/health", health)
         app.router.add_get("/capture", capture)
         app.router.add_post("/rokid/image", rokid_image)
         app.router.add_get("/rokid/audio", rokid_audio)
         app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
         app.on_cleanup.append(on_cleanup)
         return app
 
@@ -1684,6 +1716,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18_080)
     parser.add_argument("--gateway", default="localhost:8040")
+    parser.add_argument("--gateway-proto", choices=("duplex", "realtime"), default="duplex")
+    parser.add_argument("--backend-close-url", default="")
+    parser.add_argument("--prompt", default="")
+    parser.add_argument("--ui-port", type=int, default=0)
+    parser.add_argument("--record-live", action="store_true",
+                        help="record Rokid audio, preview frames and transcripts (requires --ui-port)")
+    parser.add_argument("--live-record-dir", default="live_sessions",
+                        help="parent directory for timestamped recordings")
     parser.add_argument("--gateway-tls", action="store_true", default=False)
     parser.add_argument(
         "--no-gateway-tls", dest="gateway_tls", action="store_false"
@@ -1729,6 +1769,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.record_live and not args.ui_port:
+        raise SystemExit("--record-live requires --ui-port")
     if not 0.0 <= args.session_ready_chime_volume <= 1.0:
         raise SystemExit("--session-ready-chime-volume must be between 0 and 1")
     if args.playback_echo_tail_s < 0.0:
@@ -1742,6 +1784,8 @@ def main() -> None:
         host=args.host,
         port=args.port,
         gateway=args.gateway,
+        backend_close_url=args.backend_close_url,
+        idle_prompt=args.prompt,
         gateway_tls=args.gateway_tls,
         harness_url=args.harness_url,
         harness_client_id=args.client_id,
@@ -1758,7 +1802,16 @@ def main() -> None:
         session_ready_chime_volume=args.session_ready_chime_volume,
         playback_echo_tail_s=args.playback_echo_tail_s,
     )
-    runtime = PhaseBRokidRuntime(config)
+    session_factory = GatewayDuplexSession
+    if args.gateway_proto == "realtime":
+        from .realtime_session import RealtimeDuplexSession
+        session_factory = RealtimeDuplexSession
+    if args.ui_port:
+        from .rokid_panel_runtime import PanelRokidRuntime
+        runtime = PanelRokidRuntime(config, ui_port=args.ui_port, session_factory=session_factory,
+                                    record_live=args.record_live, live_record_dir=args.live_record_dir)
+    else:
+        runtime = PhaseBRokidRuntime(config, session_factory=session_factory)
     watchdog = CtrlCExitWatchdog()
     shutdown_signals = [signal.SIGINT]
     if hasattr(signal, "SIGBREAK"):
@@ -1769,26 +1822,34 @@ def main() -> None:
 
     def handle_console_shutdown(signum: int, frame: Any) -> None:
         watchdog.arm()
-        previous_handler = previous_handlers[signum]
-        if callable(previous_handler):
-            previous_handler(signum, frame)
-        else:
-            raise KeyboardInterrupt
+        loop.call_soon_threadsafe(stop_event.set)
 
-    for signum in shutdown_signals:
-        signal.signal(signum, handle_console_shutdown)
+    loop = asyncio.new_event_loop()
+    stop_event = asyncio.Event()
+    runtime.request_shutdown = lambda: handle_console_shutdown(signal.SIGINT, None)
+
+    async def serve():
+        runner = web.AppRunner(runtime.create_app(), access_log=None,
+                               shutdown_timeout=max(0.5, config.close_timeout_s),
+                               handler_cancellation=True)
+        for signum in shutdown_signals:
+            signal.signal(signum, handle_console_shutdown)
+        try:
+            await runner.setup()
+            await web.TCPSite(runner, config.host, config.port).start()
+            await stop_event.wait()
+        finally:
+            await runner.cleanup()
+            watchdog.disarm()
+        if runtime.live_rec is not None:
+            LOG.info("[LIVE] connections closed; exporting recording from %s", runtime.live_rec.dir)
+            await asyncio.to_thread(runtime.live_rec.finalize_mp4)
     LOG.info("Rokid Phase B input: http://%s:%d", config.host, config.port)
     LOG.info("Harness: %s", config.harness_url)
     LOG.info("Gateway: %s://%s", "wss" if config.gateway_tls else "ws", config.gateway)
     try:
-        web.run_app(
-            runtime.create_app(),
-            host=config.host,
-            port=config.port,
-            access_log=None,
-            shutdown_timeout=max(0.5, config.close_timeout_s),
-            handler_cancellation=True,
-        )
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(serve())
     except OSError as exc:
         if getattr(exc, "winerror", None) == 10048:
             LOG.error(
@@ -1801,6 +1862,9 @@ def main() -> None:
             raise SystemExit(2) from None
         raise
     finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
         for signum, previous_handler in previous_handlers.items():
             signal.signal(signum, previous_handler)
         if watchdog.armed:

@@ -424,6 +424,9 @@ class AssistiveHarnessService:
             return {"type": "pong", "at_ms": now_ms()}
         if message_type == "audio.mirror":
             audio = _decode_float32(str(message.get("audio_b64") or ""))
+            if message.get("discontinuity"):
+                # Do not join words from opposite sides of missing audio.
+                runtime.vad.reset()
             utterance = runtime.vad.feed(audio, float(message.get("started_at_ms") or now_ms()))
             if utterance is None:
                 return None

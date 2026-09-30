@@ -1,5 +1,15 @@
 # Rokid Phase B Adapter
 
+## Panel startup (V2 realtime)
+
+For daily use, follow [English setup](../../../runtime/openglass_omni/STARTUP_en.md) or [中文安装与使用](../../../runtime/openglass_omni/STARTUP_zh.md). Run `python glasses_panel.py` from the repository root and select **Rokid功能对话**. The panel uses `rokid_panel_runtime`, gateway **8006** with `/v1/realtime`, Harness **8021**, sensor input **18080** and live view **8080**.
+
+Sensor app source and build/install scripts are in [rokid_app](../../../rokid_app/README.md). Recording uses `--record-live`; normal stop saves WAV and exports MP4 under `live_sessions/`.
+
+Rokid 面板使用 8006 realtime 链路。下文 8040 duplex 命令用于独立适配器；面板的首次安装、日常启动和录制见上方指南。
+
+## Standalone duplex adapter
+
 This adapter replaces the Phase A browser transport while preserving the
 frozen Harness policy and the existing MiniCPM backend:
 
@@ -26,10 +36,10 @@ The backend remains `llama.cpp-omni -> Worker -> Gateway :8040 -> MiniCPM-o
   or `--session-ready-chime-volume` (default `0.32`) to tune it.
 - Skill activation, cancellation, and return-to-chat use the same replacement
   flow with the prompt and slots supplied by Harness.
-- After a Skill Session reaches `restart_complete`, Harness injects the
+- In the duplex route, after a Skill Session reaches `restart_complete`, Harness injects the
   original one-shot task into that new Session. This makes read-text and
   experimental obstacle activation answer once instead of only changing the
-  system prompt.
+  system prompt. The panel realtime route does not support this one-shot task injection.
 - Rokid PCM is repacketized into 100 ms float32 `audio.mirror` frames, matching
   Phase A. A bounded drop-oldest queue prevents device capture from being
   blocked by Gateway latency.

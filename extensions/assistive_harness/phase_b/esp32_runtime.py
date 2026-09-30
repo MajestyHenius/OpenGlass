@@ -68,6 +68,28 @@ LOG = logging.getLogger("assistive_harness.phase_b.esp32")
 #   注意：第4字段是 reserved(pad)，固件真丢包计数 g_ring_drops 未发到 wire，
 #   PC 端用 seq 跳变推断真丢包。
 ESP32_PKT_HDR = 12
+
+
+class DeviceAudioClock:
+    """Map device capture-end ticks to PC time once; never retime delayed packets."""
+    def __init__(self):
+        self.seq = self.ticks = self.end_ms = None
+
+    def map_packet(self, seq, ticks, samples, received_ms):
+        discontinuity = self.seq is None
+        if self.seq is None:
+            self.end_ms = received_ms
+        else:
+            ds = (seq - self.seq) & 0xffffffff
+            dt = (ticks - self.ticks) & 0xffffffff
+            discontinuity = ds != 1 or dt > 2000
+            if ds == 0 or ds >= 0x80000000 or dt >= 0x80000000:
+                self.end_ms = received_ms  # Device restarted, not a 32-bit rollover.
+                discontinuity = True
+            else:
+                self.end_ms += dt
+        self.seq, self.ticks = seq, ticks
+        return self.end_ms - samples * 1000.0 / SAMPLE_RATE_IN, discontinuity
 # TCP 图像帧头 magic
 _TCP_IMG_MAGIC = 0x55AA55AA
 
@@ -372,6 +394,10 @@ async def esp32_audio_reader(
                     LOG.info("[ESP32] audio WS connected")
                     backoff = 1.0
                     stats.audio_clients = 1
+                    device_clock = DeviceAudioClock()
+                    audio_mirror.clear()
+                    mirror_next_ms = None
+                    mirror_reset = True
                     async for msg in ws:
                         if stop_evt.is_set():
                             break
@@ -382,8 +408,7 @@ async def esp32_audio_reader(
                         data = msg.data
                         if len(data) < ESP32_PKT_HDR:
                             continue
-                        # 固件包头: seq(4) ts_ms(4) n_samples(2) reserved(2)
-                        # 注意: 第4字段是 reserved(pad)，不是丢包数；真丢包用 seq 跳变推断
+                        # 当前 v2 固件包头末字段为累计 ring-buffer drops（16-bit 饱和）。
                         seq, ts_ms, n_samples, reserved = struct.unpack("<IIHH", data[:ESP32_PKT_HDR])
                         body = data[ESP32_PKT_HDR : ESP32_PKT_HDR + n_samples * 2]
                         if len(body) != n_samples * 2:
@@ -403,8 +428,17 @@ async def esp32_audio_reader(
                             stats.non_silent_audio_packets += 1
                         amplified = apply_pcm16_gain(raw, input_gain)
                         audio_queue.put_nowait(amplified)               # -> gateway session
+                        captured_ms, discontinuity = device_clock.map_packet(
+                            seq, ts_ms, n_samples, now_ms())
+                        if discontinuity:
+                            audio_mirror.clear()
+                            mirror_next_ms = captured_ms
+                            mirror_reset = True
                         for frame in audio_mirror.feed(amplified):
-                            await harness.send_audio(frame)             # -> 8021 ASR 镜像
+                            await harness.send_audio(frame, started_at_ms=mirror_next_ms,
+                                                     discontinuity=mirror_reset)
+                            mirror_next_ms += frame.size * 1000.0 / SAMPLE_RATE_IN
+                            mirror_reset = False
                         # -o record：录 user 音（原始 samples，未放大）
                         if live_rec is not None:
                             try:
@@ -418,7 +452,7 @@ async def esp32_audio_reader(
                         now = time.monotonic()
                         if now - last_log >= 5.0:
                             LOG.info(
-                                "[ESP32] rx=%d pkts seq=%d ts=%d rsv=%d rms=%.4f",
+                                "[ESP32] rx=%d pkts seq=%d ts=%d device_drops=%d rms=%.4f",
                                 stats.audio_packets, seq, ts_ms, reserved, stats.audio_rms,
                             )
                             last_log = now
@@ -1448,49 +1482,10 @@ def _insecure_ssl_for_wss(url: str) -> Optional[ssl.SSLContext]:
 
 
 class TlsHarnessClient(HarnessClient):
-    """与 HarnessClient 完全一致，仅在 ws_connect 时对 wss:// 传入自签名 ssl。
+    """Keep the existing TLS policy while sharing control and ASR handling."""
 
-    覆盖 run()：逐行照抄父类，唯一区别是 ws_connect 多了 ssl= 参数。"""
-
-    async def run(self) -> None:
-        ssl_ctx = _insecure_ssl_for_wss(self.url)
-        while not self._stop.is_set():
-            try:
-                async with aiohttp.ClientSession() as client:
-                    async with client.ws_connect(
-                        self.url, heartbeat=30, max_msg_size=0, ssl=ssl_ctx
-                    ) as ws:
-                        self.ws = ws
-                        self.connected = True
-                        LOG.info("Harness connected: %s", self.url)
-                        async for message in ws:
-                            if message.type != aiohttp.WSMsgType.TEXT:
-                                if message.type in (
-                                    aiohttp.WSMsgType.CLOSED,
-                                    aiohttp.WSMsgType.ERROR,
-                                ):
-                                    break
-                                continue
-                            payload = json.loads(message.data)
-                            message_type = payload.get("type")
-                            if message_type == "harness.ready":
-                                await self.manager.emit_recovery_sync()
-                            elif message_type == "control.intent":
-                                task = asyncio.create_task(
-                                    self.manager.handle_control(payload)
-                                )
-                                self._control_tasks.add(task)
-                                task.add_done_callback(self._control_tasks.discard)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not self._stop.is_set():
-                    LOG.warning("Harness connection failed: %s", exc)
-            finally:
-                self.connected = False
-                self.ws = None
-            if not self._stop.is_set():
-                await asyncio.sleep(self.reconnect_s)
+    def _ssl_context(self):
+        return _insecure_ssl_for_wss(self.url)
 
 
 class PhaseBEsp32Runtime(PhaseBRokidRuntime):

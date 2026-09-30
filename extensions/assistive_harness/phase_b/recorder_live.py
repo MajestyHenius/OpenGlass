@@ -252,7 +252,7 @@ class LiveRecorder:
         except Exception:
             pass
 
-    def stop(self) -> None:
+    def stop(self, *, finalize_media: bool = True) -> None:
         if not self.enabled or not self._started.is_set() or self._stopping.is_set():
             return
         self._stopping.set()
@@ -344,6 +344,8 @@ class LiveRecorder:
         self._chunks_f = None
 
         # 结束自动落盘 mp4（不用手动）：
+        if not finalize_media:
+            return
         #   ① 整簇多帧 + 角落 reject 标注（演示主用，流畅 + 可视化漏斗决策）
         #   ② best 1fps 版（兼容旧用途）
         try:

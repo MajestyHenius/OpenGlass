@@ -1,4 +1,7 @@
 version: 2
+
+# User-facing voice phrases; local overrides live beside this example.
+voice_commands_file: ../../../runtime/openglass_omni/voice_commands.example.yaml
 default_skill: idle_chat
 
 harness:
@@ -38,28 +41,9 @@ cv:
       confidence: 0.25
       image_size: 640
 
+# Voice phrases are maintained in runtime/openglass_omni/voice_commands*.yaml.
 control:
   cooldown_ms: 1200
-  stop_speech:
-    # `同一下` / `等一(一)下` are bounded aliases observed from the local
-    # FunASR model when the user clearly says the short command `停一下`.
-    # They are command-only aliases, not arbitrary substring anchors.
-    phrases: [停一下, 同一下, 等一下, 等一一下, 别说了, 闭嘴, 停止播报, 安静]
-    # Literal substring protocol: any transcript containing this anchor stops.
-    embedded_phrases: [停一下]
-  resume_speech:
-    # Literal substring protocol: any transcript containing this anchor resumes.
-    embedded_phrases: [恢复对话]
-  reset_session:
-    phrases: [重新开始]
-    # Literal substring protocol for real voice RESET. Product deployments can
-    # later prepend a wake name (for example "乐奇重新开始") without changing
-    # the deterministic router.
-    embedded_phrases: [重新开始]
-  return_to_chat:
-    phrases: [回到聊天, 回到普通聊天, 退出技能, 普通聊天, 恢复普通聊天]
-  cancel_skill:
-    phrases: [取消任务, 不找了, 不读了]
 
 skills:
   idle_chat:
@@ -69,7 +53,6 @@ skills:
     cooldown_ms: 1200
     cv_mode: disabled
     cv_provider: noop
-    activation_phrases: [普通聊天, 回到聊天]
 
   find_object:
     enabled: true
@@ -83,13 +66,6 @@ skills:
     task_trigger: '请立即根据当前画面寻找“{{target}}”，只回答它的位置；如果没看到就说没看到。'
     slot_schema:
       target: {type: string, required: true}
-    activation_patterns:
-      - "帮我找(?:一下)?(?:我的)?(?P<target>.+)"
-      - "帮我找(?P<target>.+)"
-      - "(?P<target>.+)在哪"
-      - "(?P<target>.+)在哪里"
-      - "看到(?P<target>.+)了吗"
-      - "有没有(?P<target>.+)"
 
   read_text:
     enabled: true
@@ -101,7 +77,6 @@ skills:
     cv_mode: shadow
     cv_provider: noop
     task_trigger: 请立即读取当前画面中最明显的文字，只读看到的内容。
-    activation_phrases: [读一下, 念一下, 帮我读一下, 帮我识字, 帮我读字, 上面写了什么, 这是什么字, 读文字]
 
   describe_scene:
     enabled: true
@@ -111,7 +86,6 @@ skills:
     cv_mode: shadow
     cv_provider: noop
     task_trigger: 请立即用一两句话简短描述当前画面。
-    activation_phrases: [描述一下, 帮我描述一下, 帮我描述场景, 前面有什么, 看看周围, 画面里有什么]
 
   obstacle_avoidance:
     # Experimental: enabled only for stationary, supervised browser validation.
@@ -125,4 +99,3 @@ skills:
     cv_mode: shadow
     cv_provider: noop
     task_trigger: 请立即判断当前画面前方是否有明显障碍，并给出简短、保守的安全提示。
-    activation_phrases: [帮我避障, 前面有障碍吗, 前面有没有障碍, 看一下前方障碍, 前面安全吗]

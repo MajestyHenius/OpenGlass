@@ -24,7 +24,7 @@ from unittest.mock import Mock, patch
 SOURCE = Path(__file__).resolve().parents[1] / "runtime/openglass_omni/panel.py"
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
 NODES = [node for node in TREE.body if
-    isinstance(node, ast.ClassDef) and node.name == "ProcManager" or
+    isinstance(node, ast.ClassDef) and node.name in ("ProcManager", "Api") or
     isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CONFIG" for t in node.targets)]
 NAMESPACE = dict(globals(), __file__=str(SOURCE))
 exec(compile(ast.Module(body=NODES, type_ignores=[]), str(SOURCE), "exec"), NAMESPACE)
@@ -48,11 +48,36 @@ class PanelLifecycleTests(unittest.TestCase):
     def alive(self, name):
         self.manager.procs[name] = SimpleNamespace(pid=123, poll=lambda: None)
 
+    def test_menu_only_exposes_three_named_entries(self):
+        api = NAMESPACE["Api"](self.manager, self.manager.cfg)
+        chains = api.get_config()["chains"]
+        self.assertEqual(list(chains), ["esp32", "esp32_full", "rokid"])
+        self.assertEqual([v["label"] for v in chains.values()],
+                         ["ESP32基础对话", "ESP32功能对话", "Rokid功能对话"])
+        self.assertIn("esp32_voice", self.manager.cfg["chains"])
+        self.assertIn("esp32_select", self.manager.cfg["chains"])
+        self.manager.current_chain = "esp32_full"
+        self.assertNotIn("--force-measure", self.manager._build_cmd("demo_funnel"))
+
     def test_worker_log_does_not_override_failed_health(self):
         m = self.manager
         m._ready_events["worker"].set()
         m._http_get_json = Mock(return_value={"status": "error"})
         self.assertFalse(m._probe_ready("worker")[0])
+
+    def test_rokid_requires_harness_and_model_session(self):
+        m = self.manager
+        m.current_chain = "rokid"
+        self.assertEqual(m.chain()["start_order"][-2:], ["harness", "rokid"])
+        m._http_get_json = Mock(return_value={"ok": True, "harness_connected": True})
+        self.assertFalse(m._probe_ready("rokid")[0])
+        m._http_get_json.return_value["gateway_status"] = "running"
+        self.assertTrue(m._probe_ready("rokid")[0])
+        m._wrap_conda = lambda cmd: cmd
+        cmd = m._build_cmd("rokid")
+        self.assertIn("extensions.assistive_harness.phase_b.rokid_panel_runtime", cmd)
+        self.assertIn("--backend-close-url", cmd)
+        self.assertNotIn("--glasses-psk", cmd)
 
     def test_exited_parent_still_cleans_owned_job(self):
         m = self.manager
