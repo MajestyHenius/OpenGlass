@@ -232,6 +232,8 @@ Open the live view, confirm that frames update and speak to test a response.
 
 **First Rokid wireless setup:** keep USB attached while the panel enables Wi-Fi, waits for an address, connects wireless ADB and launches the sensor. Unplug after logs confirm wireless ADB and both image/audio input work. If initialization fails, keep USB attached and check glasses Wi-Fi.
 
+**Optional: play audio through Rokid glasses.** Pair your Rokid glasses with the PC over Bluetooth and select them as the audio output device before starting the panel. This can reduce speaker audio being picked up again by the glasses’ microphone.
+
 Later panel or PC restarts reuse the saved address. If a glasses restart breaks wireless access, follow Troubleshooting below.
 
 Click Stop All when finished and wait for session cleanup and recording export before closing the window. See the [startup guide](runtime/openglass_omni/STARTUP_en.md) for details.
