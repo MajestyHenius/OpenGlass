@@ -80,3 +80,16 @@ tmp/
 *.tmp.mov
 *.tmp.avi
 *.scratch.*
+
+# Private runtime configuration and local handoff/backups
+panel.local.json
+runtime/openglass_omni/*.local.yaml
+runtime/openglass_omni/HANDOFF_*.md
+live_sessions/
+**/live_sessions/
+*-old.py
+*_backup.py
+*.before-*
+*.keystore
+*.jks
+*.apk

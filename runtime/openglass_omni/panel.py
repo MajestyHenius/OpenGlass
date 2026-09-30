@@ -6,25 +6,26 @@ SmartGlasses 现场演示控制面板 —— ALL（双链路版）
 在 glasses_panel_new.py 基础上，把 Rokid 链路也并进来。两条链路二选一：
 
   ESP32 链: llama -> worker -> gateway -> demo_esp32_duplex_0703.py
-  Rokid 链: llama -> worker -> gateway -> rokid_minicpm_v8.py
+  Rokid 链: llama -> worker -> gateway -> harness -> rokid_runtime
 
 前三级共用，只有第四级不同。顶部「链路」下拉切换，切换即换状态灯/日志页签/
 第一视角地址；Rokid 分支自动隐藏「眼镜」下拉（它是 APK 反向连进来，没有选镜这回事）。
 
-★ Rokid 必须用 v8：v7 是旧协议(/ws/duplex + prepare)，连不上新 gateway(8006, V2)。
+★ Rokid 使用 Phase B 接入模块与 /v1/realtime 协议。
 ★ run_rokid.ps1 / run_rokid_wifi.cmd 已不需要——建目录、设环境变量、拼参数、
   USB 下 adb reverse + 拉起 APK，全部内联进本面板（见 _rokid_pre_launch /
-  _rokid_env / _rokid_post_launch）。把 rokid_minicpm_v8.py 放在本面板同级目录即可。
+  _rokid_env / _rokid_post_launch）。Rokid 使用仓库内的 Phase B 接入模块。
 
 旧的 glasses_panel_new.py 保持原样不动：这条路线万一现场坏了，ESP32 链路还有退路。
 
-运行：  python glasses_panel_all.py
+运行：  python glasses_panel.py
 依赖：  pip install pywebview
-只需修改下面的 CONFIG 区块即可，其余无需改动。
+本机路径、网络和无线 adb 地址放在 runtime.local.json，见 README.md。
 """
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -54,7 +55,7 @@ CONFIG = {
     # 留空则 worker/gateway 会在面板目录找 worker.py（找不到，启动失败）。
     #"minicpm_demo_dir": r"<PATH_TO>\MiniCPM-o-Demo",
     #e.g.
-    "minicpm_demo_dir": r"D:\MiniCPM-o-Demo_0710\MiniCPM-o-Demo",
+    "minicpm_demo_dir": r"<PATH_TO>\MiniCPM-o-Demo",
 
     # 注意：眼镜 IP 不在这里配。固件走 DHCP，IP 会变，统一由 devices.json 管理、
     # 面板顶部下拉选择（见下方 devices）。此处不再放任何眼镜 IP。
@@ -70,7 +71,9 @@ CONFIG = {
 
     # worker 就绪：日志关键字命中 "Uvicorn running on ...:22400" 即放行（见 _ready_pat）。
     "worker_ready_port": 22400,
-    "worker_health_port": None,     # 关键字就绪为主，不用 HTTP health（None=关闭，避免端口配错卡顿）
+    "worker_health_port": 22400,
+    "gateway_status_url": "https://127.0.0.1:8006/status",
+    "harness_health_url": "https://127.0.0.1:8021/health",
     "health_probe_s": 15.0,
     "stable_alive_s": 8.0,
 
@@ -94,10 +97,15 @@ CONFIG = {
     "rokid_fpv_url": "http://localhost:8080",
     "rokid_save_root": "sessions",
     "rokid_log_dir": "logs",
-    # USB 模式才需要 adb reverse + 拉起 APK；WiFi 模式不需要 adb。
+    # 两种模式都走 adb reverse + APK 拉起：
+    #   usb  = 每次都要接 USB
+    #   wifi = 首次接一次 USB 让 RokidDevice 自动 `adb tcpip 5555` + `adb connect`
+    #          并把 <ip>:5555 存到 runtime.local.json 的 rokid_adb_addr；
+    #          之后就不再需要 USB（眼镜不断电、IP 不变即可）。
     "rokid_mode": "wifi",                      # "wifi" | "usb"
-    "rokid_enable_funasr": False,              # True = 加 --enable-funasr（需装 funasr 包）
-    "rokid_adb": "adb",                        # USB 模式下的 adb 路径
+    "rokid_adb_tcpip_port": 5555,              # 首次 USB 授权时 adb tcpip 的端口
+    "rokid_enable_funasr": False,              # 兼容旧配置；ASR 统一由 Harness 提供
+    "rokid_adb": "adb",                        # adb 可执行路径（wifi 模式也用）
     "rokid_package": "org.opensqz.openglass.rokid.debug",
     "rokid_activity": "org.opensqz.openglass.rokid.debug/org.opensqz.openglass.rokid.MainActivity",
 
@@ -114,10 +122,10 @@ CONFIG = {
         "llama": [
             #r"<PATH_TO>\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
             #e.g.
-            r"D:\New llama\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
+            r"<PATH_TO>\llama.cpp-omni\build\bin\Release\llama-omni-server.exe",
             #"-m", r"<PATH_TO>\MiniCPM-o-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             # e.g.
-            "-m", r"C:\SmartGlasses\MiniCPM-o-4-5-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
+            "-m", r"<PATH_TO>\MiniCPM-o-4-5-gguf\MiniCPM-o-4_5-Q4_K_M.gguf",
             "-ngl", "99",
             "--host", "127.0.0.1",
             "--port", "22500",
@@ -169,30 +177,58 @@ CONFIG = {
             "--connect-retry",
         ],
 
-        # ⑤ rokid bridge —— 与 demo 平行、二选一的“第四个进程”。
+        # ⑤ 8021 harness —— 语音控制腿（停一下/重新开始/找物），也是 ASR 来源。
+        #    只有 ②③④ 带 harness 的链路才起它。
+        #    ★ 开源用户必改：--model-path 指向你机器上的 FunASR 流式模型目录 ★
+        #    证书：自签即可，只为过 wss 握手，不绑机器；客户端全是 CERT_NONE 不校验。
+        #    ★ 它在 extensions/ 下，用 -m 启动，因此 cwd 必须是 MiniCPM-o-Demo 目录
+        #      （见 _spawn 里的 name in (...) 白名单）。
+        "harness": [
+            "python", "-m", "extensions.assistive_harness.server", "--enabled",
+            #"--model-path", r"<PATH_TO>\LocalASRmodel\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+            # e.g.
+            "--model-path", (r"<PATH_TO>\LocalASRmodel"
+                             r"\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"),
+            "--port", "8021",
+            # 绝对路径：harness 的 cwd 是 OpenGlass 仓库根，而证书由 _ensure_certs
+            # 生成在 minicpm_demo_dir/certs 下（gateway 也用同一对）。
+            "--certfile", "{certfile}",
+            "--keyfile", "{keyfile}",
+        ],
+
+        # ⑥ demo_funnel —— esp32_runtime（harness + CV 漏斗）。与 ④ demo 互斥：
+        #    两者都要独占 ESP32 的音频 WS 和图像 TCP，不能同时跑。
+        #    这里只放各档位共用的参数；--esp32-host/--esp32-port/--rotate 由
+        #    devices.json 填（_device_args），漏斗档位参数由 _funnel_extra_args 追加。
+        #    ★ 同样在 extensions/ 下，cwd 必须是 MiniCPM-o-Demo 目录。
+        #    ★ 8006 是 TLS（https:// 能取到 openapi.json，http:// 是 Empty reply），
+        #      走默认 wss，**不要**加 --no-tls；而 harness 8021 是自签 wss，两者都是 wss
+        #      但证书来源不同。
+        "demo_funnel": [
+            "python", "-m", "extensions.assistive_harness.phase_b.esp32_runtime",
+            "--gateway", "localhost:8006",
+            "--harness-url", "wss://127.0.0.1:8021/ws/control",
+            "--image-tcp-port", "5000",
+            "--web-ui-port", "8080",
+            "--record-live",
+            "--prompt", "{prompt}",
+        ],
+
+        # ⑦ rokid bridge —— 与 demo 平行、二选一的“第四个进程”。
         #    注意：它不是客户端去连眼镜，而是在 PC 上开 18080 端口等 APK 连进来。
-        #    ★ 用 v8（API V2）。v7 是旧协议(/ws/duplex)，连不上新 gateway:8006。
+        #    使用 Phase B + RealtimeDuplexSession 接入 V2 gateway:8006。
         #    ★ run_rokid.ps1 / run_rokid_wifi.cmd 已不再需要——它们做的事
         #      （建目录、设环境变量、拼参数、USB 下 adb reverse + 拉起 APK）
         #      全部内联到本面板里了，见 _rokid_pre_launch() 与 _spawn()。
         "rokid": [
-            "python", "{here}/rokid_minicpm_v8.py",
-            "--host", "0.0.0.0",
-            "--port", "18080",
-            # v8 默认已是 ws + 8006，这里显式写出，方便现场改
-            "--gateway", "localhost:8006",
-            #"--no-gateway-tls",
-            "--gateway-tls",
-            "--save-session",
-            "--save-root", "sessions",
-            "--image-enhance", "auto",
-            "--image-rotate-cw", "270",
-            "--log-level", "INFO",
-            # live.html 观测页（与 ESP32 demo 同一套 bridge_ui 前端/模板）
-            "--ui-port", "8080",
+            "python", "-m", "extensions.assistive_harness.phase_b.rokid_panel_runtime",
+            "--host", "0.0.0.0", "--port", "18080",
+            "--gateway", "localhost:8006", "--gateway-tls",
+            "--gateway-proto", "realtime",
+            "--harness-url", "wss://127.0.0.1:8021/ws/control",
+            "--image-rotate-cw", "270", "--ui-port", "8080",
             "--prompt", "{prompt}",
-            "--glasses-ssid", "SQZ",
-            "--glasses-psk", "sqz.ac.cn",
+            "--record-live",
         ],
     },
 
@@ -202,23 +238,84 @@ CONFIG = {
     #   rokid → rokid_minicpm_v7.py      （PC 开端口等 APK 连进来，无 device）
     "chains": {
         "esp32": {
-            "label": "ESP32 眼镜",
+            "label": "ESP32基础对话",
             "tail": "demo",                      # 第四级进程名
             "start_order": ["llama", "worker", "gateway", "demo"],
             "stop_order":  ["demo", "gateway", "worker", "llama"],
             "need_device": True,                 # 显示眼镜下拉
             "fpv_key": "fpv_url",                # 第一视角地址
         },
+        # ── 以下三条走 esp32_runtime（harness + 漏斗），四档递进演示 ──
+        #   ① 基础对话 = 上面的 "esp32"（esp32_bridge.py，无 harness 无漏斗）
+        #   ② 语音控制 = harness 开、漏斗关
+        #   ③ 质量筛选 = ② + 每秒多帧里挑最清晰的一张
+        #   ④ 完整防幻觉 = ③ + 坏图拦下，只记日志，不自动暂停或播提示
+        #   每档只比上一档多一件事：看到什么说什么 → 能听懂指令 → 图会挑 → 坏图会拦
+        #   （没有"只对焦"这一档：对焦后要等 settle 再重抓，1s chunk 时序固定，
+        #     对焦后那张未必赶得上这一轮，等于花了时间没用上。）
+        "esp32_voice": {
+            "label": "② 语音控制",
+            "hidden": True,
+            "tail": "demo_funnel",
+            "funnel": 0,                         # 漏斗档位：0 关 / 2 选图 / 3 选图+拒绝
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
+        },
+        "esp32_select": {
+            "label": "③ 质量筛选",
+            "hidden": True,
+            "tail": "demo_funnel",
+            "funnel": 2,
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
+        },
+        "esp32_full": {
+            "label": "ESP32功能对话",
+            "tail": "demo_funnel",
+            "funnel": 3,
+            "start_order": ["llama", "worker", "gateway", "harness", "demo_funnel"],
+            "stop_order":  ["demo_funnel", "harness", "gateway", "worker", "llama"],
+            "need_device": True,
+            "fpv_key": "fpv_url",
+        },
         "rokid": {
-            "label": "Rokid 眼镜",
+            "label": "Rokid功能对话",
             "tail": "rokid",
-            "start_order": ["llama", "worker", "gateway", "rokid"],
-            "stop_order":  ["rokid", "gateway", "worker", "llama"],
+            "start_order": ["llama", "worker", "gateway", "harness", "rokid"],
+            "stop_order":  ["rokid", "harness", "gateway", "worker", "llama"],
             "need_device": False,                # bridge 不需要眼镜 IP
             "fpv_key": "rokid_fpv_url",
         },
     },
     "default_chain": "esp32",
+
+    # 判据档位：漏斗的两套标定参数。对外用场景名，不暴露内部值。
+    #   严格 = medicine  （药盒小字高危，worst_x0=6.5 ACCEPT_Q=0.55）
+    #   日常 = stationery（生活用品，worst_x0=5.0 ACCEPT_Q=0.48）
+    "scenes": {"严格判据": "medicine", "日常判据": "stationery"},
+    "default_scene": "严格判据",
+
+    # 档位④的提示音目录。**跟着 extensions 包走**（和 bridge_ui 的 templates/ 同思路），
+    # 不落在上游 MiniCPM-o-Demo 里，保持三仓库独立。这里是相对 OpenGlass 仓库根，
+    # panel 会拼成绝对路径传给 esp32_runtime（它的 cwd 是上游，相对路径会指错地方）。
+    # 启动前检查，缺了就报错 —— 而不是跑起来才发现没声音，那时 duplex 已在跑，
+    # 没法当场用 gen_reject_wavs.py 生成。
+    "reject_wav_dir": "extensions/assistive_harness/phase_b/assets/reject_wav",
+
+    # 进程的界面显示名（灯泡/日志页签用）。内部名不变，只影响 UI。
+    "proc_labels": {
+        "llama": "推理后端",
+        "worker": "worker",
+        "gateway": "gateway",
+        "harness": "语音控制(8021)",
+        "demo": "眼镜",
+        "demo_funnel": "眼镜+漏斗",
+        "rokid": "Rokid",
+    },
 
     # 可选眼镜（对应 devices.json 里的 name）。面板顶部下拉选择。仅 ESP32 分支用。
     "devices": ["左镜", "右镜", "备用镜"],
@@ -278,22 +375,225 @@ if _names:
 
 
 # ============================================================================
+def _load_device_map(path="devices.json"):
+    """读整份设备表：name -> {host, port, rotate}。
+
+    原来只取 name（下拉用）。但 esp32_bridge 自己读 json（--device-config），
+    而 esp32_runtime 不读，它只认 --esp32-host/--esp32-port/--rotate，
+    所以由 panel 把这几项取出来填。rotate 尤其不能漏：摄像头物理侧装，
+    不转正的话漏斗的方向检测会把"相机侧装"误判成"用户把盒子拿反了"。
+    utf-8-sig：记事本/VSCode 存的 json 可能带 BOM，用 utf-8 读会炸在第一个字符。
+    """
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        for d in data.get("devices", []):
+            n = d.get("name")
+            if not n:
+                continue
+            out[n] = {
+                "host": d.get("esp32_host", ""),
+                "port": int(d.get("esp32_port", 80)),
+                "rotate": int(d.get("rotate", 0)) % 360,
+            }
+    except FileNotFoundError:
+        print(f"[panel] 未找到 {path}，带漏斗的链路(②③④)将无法自动填 IP")
+    except Exception as e:
+        print(f"[panel] 读取 {path} 失败({e})")
+    return out
+
+
+CONFIG["device_map"] = _load_device_map(_dev_path)
+if CONFIG["device_map"]:
+    print("[panel] 设备详情: " + ", ".join(
+        f"{k}({v['host']} rot={v['rotate']})" for k, v in CONFIG["device_map"].items()))
+
+
+def _load_runtime_local():
+    """读 runtime.local.json —— 本机路径与私密配置，**不进仓库**。
+
+    为什么要它：panel.py 里原本写死了五处本机绝对路径
+    （conda 环境、MiniCPM-o-Demo 目录、llama-omni-server.exe、主 gguf、FunASR 模型），
+    还有眼镜 WiFi 的明文密码。开源后每个人都要改源码才能跑，密码也会进 git 历史。
+    改成从这个文件读，clone 下来只需 `cp runtime.example.json runtime.local.json` 再填。
+
+    键名沿用仓库里已有的 runtime.example.json 风格。
+    找不到文件时保留 CONFIG 里的默认值（也就是原来的写死值），行为不变。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    f = os.path.join(here, "runtime.local.json")
+    # 无论文件存不存在，都把路径暴露出去 —— RokidDevice 首次成功建立无线 ADB
+    # 后要写回 rokid_adb_addr；文件缺失时它会创建新文件。
+    CONFIG["runtime_local_path"] = f
+    if not os.path.isfile(f):
+        print(f"[panel] 未找到 {f}")
+        print("[panel]   请复制 runtime.example.json 为 runtime.local.json 并填写本机路径；")
+        print("[panel]   否则将沿用 panel.py 里的默认值（多半不是你的路径）。")
+        return {}
+    try:
+        with open(f, "r", encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except Exception as e:
+        print(f"[panel] 读取 runtime.local.json 失败({e})，沿用默认值")
+        return {}
+
+    def _expand(v):
+        return os.path.expandvars(os.path.expanduser(v)) if isinstance(v, str) else v
+
+    n = 0
+    # ① 简单键 -> CONFIG 顶层
+    #    rokid_adb_addr 是 RokidDevice 首次通过 USB 建立无线调试后自己写回来的
+    #    （形如 "GLASSES_IP:5555"）。手动填也行，但一般用不到。
+    for src_key, dst_key in (("conda_env", "conda_env"),
+                             ("minicpm_demo_root", "minicpm_demo_dir"),
+                             ("rokid_mode", "rokid_mode"), ("rokid_adb", "rokid_adb"),
+                             ("rokid_serial", "rokid_serial"), ("rokid_pc_url", "rokid_pc_url"),
+                             ("rokid_adb_addr", "rokid_adb_addr"),
+                             ("rokid_adb_tcpip_port", "rokid_adb_tcpip_port")):
+        v = _expand(cfg.get(src_key))
+        if v:
+            CONFIG[dst_key] = v
+            n += 1
+    # ② 需要替换到命令行数组里的
+    def _sub(proc, old_pred, new_val):
+        """把 procs[proc] 里满足 old_pred 的那一项换成 new_val。"""
+        arr = CONFIG["procs"].get(proc)
+        if not arr or not new_val:
+            return 0
+        for i, x in enumerate(arr):
+            if isinstance(x, str) and old_pred(x):
+                arr[i] = new_val
+                return 1
+        return 0
+
+    n += _sub("llama", lambda x: x.lower().endswith("llama-omni-server.exe")
+              or x.lower().endswith("llama-omni-server"),
+              _expand(cfg.get("llama_server")))
+    n += _sub("llama", lambda x: x.lower().endswith(".gguf"),
+              _expand(cfg.get("llama_model")))
+    n += _sub("harness", lambda x: "speech_paraformer" in x or "LocalASRmodel" in x,
+              _expand(cfg.get("asr_model")))
+    print(f"[panel] 已读入 runtime.local.json（生效 {n} 项）")
+    return cfg
+
+
+def _load_local_secrets(rt):
+    """眼镜 WiFi（Rokid 链路传给 APK）。同样来自 runtime.local.json，
+    写死在 panel.py 里就等于明文密码进公开仓库。"""
+    out = {"glasses_ssid": "<YOUR_WIFI_SSID>", "glasses_psk": "<YOUR_WIFI_PASSWORD>"}
+    g = (rt or {}).get("glasses") or {}
+    for k in ("glasses_ssid", "glasses_psk"):
+        v = g.get(k.replace("glasses_", "")) or (rt or {}).get(k)
+        if v:
+            out[k] = v
+    return out
+
+
+_RTLOCAL = _load_runtime_local()
+CONFIG["local"] = _load_local_secrets(_RTLOCAL)
+
+
+def _ensure_certs(base_dir):
+    """确保 certs/cert.pem + key.pem 存在，没有就自签一对。
+
+    gateway(8006) 和 harness(8021) 都用这一对（gateway.py 的默认值就是
+    certs/cert.pem，缺了会直接报错退出），所以四条链路都需要它。
+    自签证书**不绑机器**，里面没有硬件信息；客户端全是 CERT_NONE 不校验，
+    只是为了让 wss 握手能过。所以本地生成一份即可，不必也不该提交进仓库。
+
+    优先用 cryptography 库；没装就退回调 openssl；都不行就打出手动命令。
+    """
+    if not base_dir or not os.path.isdir(base_dir):
+        return False
+    d = os.path.join(base_dir, "certs")
+    cert = os.path.join(d, "cert.pem")
+    key = os.path.join(d, "key.pem")
+    if os.path.isfile(cert) and os.path.isfile(key):
+        return True
+    os.makedirs(d, exist_ok=True)
+    print(f"[panel] 未找到证书，正在生成自签证书 -> {d}")
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime as _dt
+
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = _dt.datetime.now(_dt.timezone.utc)
+        crt = (x509.CertificateBuilder()
+               .subject_name(name).issuer_name(name)
+               .public_key(k.public_key())
+               .serial_number(x509.random_serial_number())
+               .not_valid_before(now - _dt.timedelta(days=1))
+               .not_valid_after(now + _dt.timedelta(days=3650))
+               .add_extension(x509.SubjectAlternativeName([
+                   x509.DNSName("localhost"),
+                   x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1")),
+               ]), critical=False)
+               .sign(k, hashes.SHA256()))
+        with open(key, "wb") as f:
+            f.write(k.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()))
+        with open(cert, "wb") as f:
+            f.write(crt.public_bytes(serialization.Encoding.PEM))
+        print("[panel] 证书已生成（cryptography，有效期 10 年）")
+        return True
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[panel] cryptography 生成失败({e})，改试 openssl")
+
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+             "-keyout", key, "-out", cert, "-days", "3650",
+             "-nodes", "-subj", "/CN=localhost"],
+            check=True, capture_output=True, timeout=60)
+        print("[panel] 证书已生成（openssl，有效期 10 年）")
+        return True
+    except Exception as e:
+        print(f"[panel] !! 自动生成证书失败: {e}")
+        print(f"[panel]    请手动执行（在 {base_dir} 下）：")
+        print("[panel]    openssl req -x509 -newkey rsa:2048 "
+              "-keyout certs/key.pem -out certs/cert.pem "
+              "-days 3650 -nodes -subj \"/CN=localhost\"")
+        return False
+
+
+_ensure_certs(CONFIG.get("minicpm_demo_dir") or CONFIG.get("cwd"))
+
+
 class ProcManager:
     """管理三个子进程：起停、状态轮询、日志收集、端口/就绪探测。"""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.procs = {}          # name -> Popen
+        self._jobs = {}          # Windows ownership survives an exited parent.
+        self._shutting_down = False
         self.logs = {n: deque(maxlen=400) for n in cfg["procs"]}
         # —— 关键字就绪：命中即放行，不再 poll /health ——
         _wp = cfg.get("worker_ready_port", 22400)
         self._ready_pat = {
             "worker": re.compile(rf"Uvicorn running on http://[\d.]+:{_wp}"),
+            "demo": re.compile(r"\[GW\] session\.created id="),
+            "demo_funnel": re.compile(r"\[GW\] prepared session="),
         }
         self._ready_events = {n: threading.Event() for n in cfg["procs"]}
         self.status = {n: "stopped" for n in cfg["procs"]}  # stopped/starting/running/crashed
         self.current_prompt = next(iter(cfg["presets"].values()))
         self.current_device = (cfg.get("devices") or ["默认"])[0]
+        self.current_scene = cfg.get("default_scene", "严格判据")
+        # 尾进程是"为哪套配置"起的。②③④ 共用 demo_funnel 这一个进程名，
+        # 只看进程活着就跳过启动的话，切链路后新的漏斗参数永远不会生效 ——
+        # UI 显示④，实际还在跑②。所以记指纹，变了就重启。
+        self._tail_started_for = {}      # tail 进程名 -> 指纹
         # —— 当前链路：esp32 / rokid，决定第四级起哪个进程 ——
         self.current_chain = cfg.get("default_chain", "esp32")
         self._lock = threading.Lock()
@@ -303,6 +603,11 @@ class ProcManager:
         self._cancel = threading.Event()
         # —— 新增：正被主动停止的进程集合，避免轮询把它误判成 crashed ——
         self._stopping = set()
+        self._backend_recovery_required = False
+        self._panel_log_lock = threading.Lock()
+        self._panel_log_path = os.path.join(
+            cfg.get("proc_log_dir", "logs"),
+            f"panel_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.log")
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     # ---- 新增：可被急停打断的睡眠 ----
@@ -337,20 +642,55 @@ class ProcManager:
         import os as _os
         _here = _os.path.dirname(_os.path.abspath(__file__))
         cmd = [x.replace("{here}", _here) if isinstance(x, str) else x for x in cmd]
+        if name == "gateway" and not any(
+            x in ("--workers", "--num-workers") or
+            x.startswith(("--workers=", "--num-workers=")) for x in cmd
+        ):
+            # Match the IPv4 endpoint checked by the panel; the upstream default
+            # localhost can also resolve to ::1 while worker binds IPv4 only.
+            port = self.cfg.get("worker_health_port") or self.cfg.get("worker_ready_port", 22400)
+            cmd += ["--workers", f"127.0.0.1:{port}"]
         # demo 要 prompt + device；rokid bridge 只要 prompt（它没有 device 概念）
         if name == "demo":
             subst = {"{prompt}": self.current_prompt, "{device}": self.current_device}
             cmd = [subst.get(x, x) for x in cmd]
-        elif name == "rokid":
+        elif name == "harness":
+            # 证书用绝对路径：harness 的 cwd 是 OpenGlass 仓库根，
+            # 而证书由 _ensure_certs 生成在 minicpm_demo_dir/certs 下（gateway 共用）。
+            _base = self.cfg.get("minicpm_demo_dir") or "."
+            subst = {
+                "{certfile}": os.path.join(_base, "certs", "cert.pem"),
+                "{keyfile}": os.path.join(_base, "certs", "key.pem"),
+            }
+            cmd = [subst.get(x, x) for x in cmd]
+        elif name == "demo_funnel":
+            # esp32_runtime：prompt + 设备参数(IP/端口/旋转) + 漏斗档位
             subst = {"{prompt}": self.current_prompt}
             cmd = [subst.get(x, x) for x in cmd]
-            cmd += self._rokid_extra_args()   # 内联 ps1 的 --enable-funasr 分支
+            cmd += self._device_args()
+            cmd += self._funnel_extra_args()
+            from urllib.parse import urlsplit
+            backend = urlsplit(self.cfg["llama_health_url"])
+            cmd += ["--backend-close-url", f"{backend.scheme}://{backend.netloc}"]
+        elif name == "rokid":
+            cmd = [self.current_prompt if x == "{prompt}" else x for x in cmd]
+            from urllib.parse import urlsplit
+            backend = urlsplit(self.cfg["llama_health_url"])
+            cmd += ["--backend-close-url", f"{backend.scheme}://{backend.netloc}"]
         return self._wrap_conda(cmd)
 
     # ---- 日志 ----
-    def _log(self, name, line):
+    def _log(self, name, line, persist=True):
         ts = time.strftime("%H:%M:%S")
         self.logs[name].append(f"[{ts}] {line.rstrip()}")
+        if persist:
+            try:
+                with self._panel_log_lock:
+                    os.makedirs(os.path.dirname(self._panel_log_path), exist_ok=True)
+                    with open(self._panel_log_path, "a", encoding="utf-8") as fh:
+                        fh.write(f"[{ts}] [{name}] {line.rstrip()}\n")
+            except OSError:
+                pass
 
     def _open_proc_logfile(self, name):
         """为进程 name 打开一个落盘日志文件（logs/<name>_<stamp>.log）。
@@ -376,7 +716,11 @@ class ProcManager:
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
-                self._log(name, line)
+                self._log(name, line, persist=False)
+                if (self.procs.get(name) is proc
+                        and "[GW-LIFECYCLE] close_unconfirmed" in line):
+                    self._backend_recovery_required = True
+                    self._log(name, "!! 旧会话关闭未确认；再次启动前请先全部停止")
                 if fh is not None:
                     try:
                         fh.write(line)
@@ -384,12 +728,17 @@ class ProcManager:
                     except Exception:
                         pass
                 # 命中就绪关键字：立即置位，_wait_ready_or_die 会马上放行
-                if pat and not self._ready_events[name].is_set() and pat.search(line):
+                if (self.procs.get(name) is proc and pat
+                        and not self._ready_events[name].is_set() and pat.search(line)):
                     self._ready_events[name].set()
-                    self._log(name, "✅ 就绪关键字命中(端口已监听)，直接进入下一步")
+                    self._log(name, "收到启动就绪日志")
         except Exception:
             pass
         finally:
+            code = proc.poll()
+            if code is not None:
+                self._log(name, f"进程日志结束 pid={proc.pid} exit={code} "
+                               f"hex=0x{code & 0xffffffff:08X}")
             if fh is not None:
                 try:
                     fh.close()
@@ -420,21 +769,110 @@ class ProcManager:
     #   4) USB 模式：adb reverse tcp:18080 + 唤醒并拉起眼镜 APK
     #   5) WiFi 模式：不碰 adb，只打印本机 IPv4 供你核对 APK 里编进去的 IP
     def _rokid_env(self):
-        """Rokid 专属环境变量（对应 ps1 里的 $env: 那几行）。"""
-        env = {}
-        log_dir = self.cfg.get("rokid_log_dir", "logs")
-        save_root = self.cfg.get("rokid_save_root", "sessions")
-        for d in (log_dir, save_root):
-            try:
-                os.makedirs(d, exist_ok=True)
-            except Exception as e:
-                self._log("rokid", f"!! 建目录失败 {d}: {e}")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        mode = self.cfg.get("rokid_mode", "wifi")
-        env["ROKID_V7_LOG_FILE"] = os.path.join(log_dir, f"rokid_{mode}_{stamp}.log")
-        env["PYTHONUNBUFFERED"] = "1"
-        self._log("rokid", f"日志: {env['ROKID_V7_LOG_FILE']}")
-        return env
+        # stdout/stderr are already captured in the panel's per-process log.
+        return {"PYTHONUNBUFFERED": "1"}
+
+    def _device_args(self):
+        """从 devices.json 取当前眼镜的 IP / 端口 / 旋转角，填给 esp32_runtime。"""
+        d = (self.cfg.get("device_map") or {}).get(self.current_device)
+        if not d or not d.get("host"):
+            self._log("demo_funnel",
+                      f"!! devices.json 里找不到「{self.current_device}」的 esp32_host")
+            return []
+        args = ["--esp32-host", d["host"], "--esp32-port", str(d.get("port", 80))]
+        if d.get("rotate"):
+            args += ["--rotate", str(d["rotate"])]
+        return args
+
+    def _funnel_extra_args(self):
+        """按链路的档位追加漏斗参数。
+
+            0  语音控制    不加 → 走 no_funnel 分支，每轮取一帧直发
+            2  质量筛选    --funnel --no-reject → 选 best 但永远放行
+            3  完整防幻觉  --funnel → 选 best + 静默拒绝，只记录日志
+        """
+        lv = int(self.chain().get("funnel", 0))
+        if lv <= 0:
+            return []
+        scene = self.cfg["scenes"].get(self.current_scene, "medicine")
+        args = ["--funnel", "--scene", scene]
+        if lv == 2:
+            args += ["--no-reject"]
+        return args
+
+    def _check_deps(self):
+        """②③④ 启动前检查关键依赖，缺了就说清楚缺什么、怎么装。
+
+        为什么值得单独查：paddleocr 装不上时，方向分类器会**静默回退**到
+        早期的简易判据，表现是画面明明是正的却一直报"画面好像反了"、
+        接着播报把帧间隔拉长又误报"晃动" —— 全程不报错，极难定位。
+        实测踩过：panel 在没装好 paddle 的环境里启动，一上来就全是 orient_flipped。
+        """
+        lv = int(self.chain().get("funnel", 0))
+        need = [("aiohttp", "aiohttp"), ("numpy", "numpy"),
+                ("PIL", "Pillow"), ("sounddevice", "sounddevice")]
+        if self.chain().get("tail") in ("demo_funnel", "rokid"):
+            need += [("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
+                     ("yaml", "PyYAML"), ("funasr", "funasr")]
+        if lv >= 2:
+            need += [("cv2", "opencv-python")]
+        if lv >= 3 or lv == 2:
+            need += [("paddle", "paddlepaddle"), ("paddleocr", "paddleocr")]
+        import importlib.util as _iu
+        missing = [pip for mod, pip in need if _iu.find_spec(mod) is None]
+        if missing:
+            tail = self.chain().get("tail") or "demo"
+            self._log(tail, "!! 缺少依赖: " + ", ".join(missing))
+            self._log(tail, "   请在**启动 panel 的那个 conda 环境**里安装：")
+            self._log(tail, "     pip install " + " ".join(missing))
+            self._log(tail, "   （完整清单见 extensions/requirements-phase-b.txt）")
+            return False
+        return True
+
+    def _check_extensions(self):
+        """②③④ 需要 OpenGlass 仓库内的 extensions/ 包完整。
+
+        不需要复制到别处 —— _spawn 把 cwd 设成 OpenGlass 仓库根。
+        缺文件时子进程会起来立刻死、日志里一行 No module named extensions，
+        面板上只看到灯变红，所以提前拦住并说清楚。
+        """
+        if self.chain().get("tail") not in ("demo_funnel", "rokid"):
+            return True
+        f = os.path.join(self._repo_root(), "extensions", "assistive_harness",
+                         "phase_b", "rokid_runtime.py" if self.chain().get("tail") == "rokid" else "esp32_runtime.py")
+        if not os.path.isfile(f):
+            self._log("demo_funnel",
+                      f"!! 未找到 {f}\n"
+                      f"   ②③④ 需要仓库内的 extensions/ 包，请确认它没有被删除或移动。")
+            return False
+        return True
+
+    def _repo_root(self):
+        """OpenGlass 仓库根（panel.py 在 runtime/openglass_omni/ 下，往上三级）。"""
+        return os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+
+    def _reject_wav_dir(self):
+        d = self.cfg.get("reject_wav_dir",
+                         "extensions/assistive_harness/phase_b/assets/reject_wav")
+        return d if os.path.isabs(d) else os.path.join(self._repo_root(), d)
+
+    def _check_reject_wav(self):
+        """档位④要播提示音，wav 必须事先用 gen_reject_wavs.py 生成好
+        （且要在 duplex 没跑的时候生成）。这里只检查，不在面板里现场生成。"""
+        if "--force-measure" not in self._funnel_extra_args():
+            return True
+        full = self._reject_wav_dir()
+        try:
+            n = len([x for x in os.listdir(full) if x.lower().endswith(".wav")])
+        except Exception:
+            n = 0
+        if n == 0:
+            self._log("demo_funnel",
+                      f"!! {full} 里没有 wav。档位④要播提示音，"
+                      f"请先在 duplex 未运行时跑 gen_reject_wavs.py 生成。")
+            return False
+        return True
 
     def _rokid_extra_args(self):
         """按配置追加参数（对应 ps1 里的 $bridgeArgs += ...）。"""
@@ -454,64 +892,92 @@ class ProcManager:
             pass
         return out
 
+    # ------------------------------------------------------------------ helpers
+    def _preflight_firewall(self, port: int) -> None:
+        """放行 port 入站。已存在同名规则则跳过。仅 Windows。
+        非管理员时先直连 netsh 试一次，失败再走一次 UAC 提权（一次同意后规则永久保留，
+        以后启动 panel 不再弹）。这是 v8 里说的"防火墙默认挡 18080 入站 → curl timeout"
+        那件事，眼镜 SYN 被 Windows 直接吃掉，rokid 端根本看不到，因此必须做。"""
+        if os.name != "nt":
+            return
+        rule = f"RokidBridge{port}"
+        try:
+            p = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+        except Exception:
+            rc, out = 1, ""
+        if rc == 0 and rule in out:
+            self._log("rokid", f"[PRE] 防火墙规则已存在: {rule}")
+            return
+        self._log("rokid", f"[PRE] 添加防火墙规则 {rule} (TCP {port})…")
+        add_args = ("advfirewall firewall add rule "
+                    f"name={rule} dir=in action=allow protocol=TCP localport={port}")
+        # 先按当前权限尝试
+        try:
+            p = subprocess.run(
+                ["netsh"] + add_args.split(),
+                capture_output=True, text=True, timeout=15,
+            )
+            if p.returncode == 0:
+                self._log("rokid", f"[PRE] 防火墙已放行 TCP {port}")
+                return
+            self._log("rokid", f"[PRE] 非管理员放行失败 (rc={p.returncode})，尝试 UAC 提权…")
+        except Exception as e:
+            self._log("rokid", f"[PRE] netsh 直连异常: {e}，尝试 UAC 提权…")
+
+        # 提权路径：PowerShell Start-Process -Verb RunAs 弹一次 UAC；
+        # 用户点是后规则永久保留，之后每次启动都命中"已存在"直接跳过。
+        try:
+            ps_cmd = (
+                f"$p = Start-Process -FilePath netsh -ArgumentList '{add_args}' "
+                "-Verb RunAs -WindowStyle Hidden -PassThru -Wait; "
+                "exit $p.ExitCode"
+            )
+            p = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=60,
+            )
+            if p.returncode == 0:
+                self._log("rokid", f"[PRE] 防火墙已放行 TCP {port}（经 UAC 提权）")
+            else:
+                err = (p.stderr or p.stdout or "").strip()
+                self._log("rokid", f"[PRE] !! UAC 提权添加失败 rc={p.returncode}: {err or '(可能被拒绝)'}")
+                self._log("rokid", "[PRE] !! 眼镜的 TCP SYN 可能被 Windows 防火墙丢弃，"
+                                    "rokid 端不会看到任何请求。请重跑 panel 并在 UAC 弹窗点"
+                                    "\"是\"，或以管理员身份启动 panel。")
+        except Exception as e:
+            self._log("rokid", f"[PRE] !! UAC 提权命令异常: {e}")
+
     def _rokid_pre_launch(self):
-        """起 bridge 之前该做的事。USB 才用 adb；WiFi 只提示 IP。"""
-        mode = self.cfg.get("rokid_mode", "wifi")
-        port = int(self.cfg.get("rokid_port", 18080))
-        if mode == "usb":
-            adb = self.cfg.get("rokid_adb", "adb")
-            self._log("rokid", f"USB 模式：adb reverse tcp:{port}")
-            try:
-                subprocess.run([adb, "reverse", "--remove", f"tcp:{port}"],
-                               capture_output=True, timeout=10)
-                r = subprocess.run([adb, "reverse", f"tcp:{port}", f"tcp:{port}"],
-                                   capture_output=True, text=True, timeout=10)
-                if r.returncode != 0:
-                    self._log("rokid", f"!! adb reverse 失败: {r.stderr.strip()}")
-            except FileNotFoundError:
-                self._log("rokid", f"!! 找不到 adb（{adb}），USB 模式无法转发端口")
-            except Exception as e:
-                self._log("rokid", f"!! adb reverse 异常: {e}")
-        else:
-            ips = self._local_ipv4s()
-            self._log("rokid", f"WiFi 模式：本机 IPv4 = {', '.join(ips) if ips else '未探测到'}")
-            self._log("rokid", "注意：眼镜 APK 里的 PC IP 是编译期常量，必须与上面某个 IP 一致")
+        from runtime.openglass_omni.rokid_device import RokidDevice
+        self._rokid_device = RokidDevice(self.cfg, lambda msg: self._log("rokid", msg))
+        try:
+            if self.cfg.get("rokid_mode", "wifi") == "wifi":
+                self._preflight_firewall(int(self.cfg.get("rokid_port", 18080)))
+            self._rokid_device.prepare()
+        except Exception as exc:
+            self._log("rokid", f"[PRE] {exc}; PC 接收服务仍会启动")
 
     def _rokid_post_launch(self):
-        """bridge 就绪后拉起眼镜 APK（仅 USB；WiFi 下眼镜自己会连进来）。
-        对应 ps1 里的 Start-RokidLaunchJob。"""
-        if self.cfg.get("rokid_mode", "wifi") != "usb":
+        device = getattr(self, "_rokid_device", None)
+        if device is None or not device.prefix or len(device.prefix) < 3:
+            self._log("rokid", "[PRE] 未选定眼镜，跳过设备启动")
             return
-        adb = self.cfg.get("rokid_adb", "adb")
-        pkg = self.cfg.get("rokid_package", "")
-        act = self.cfg.get("rokid_activity", "")
-
         def run():
             try:
-                subprocess.run([adb, "shell", "am", "force-stop", pkg],
-                               capture_output=True, timeout=10)
-                subprocess.run([adb, "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
-                               capture_output=True, timeout=10)
-                subprocess.run([adb, "shell", "wm", "dismiss-keyguard"],
-                               capture_output=True, timeout=10)
-                time.sleep(1.0)
-                self._log("rokid", "拉起眼镜采集 APK…")
-                r = subprocess.run([adb, "shell", "am", "start", "-S", "-W", "-n", act],
-                                   capture_output=True, text=True, timeout=20)
-                if r.returncode != 0:
-                    subprocess.run([adb, "shell", "monkey", "-p", pkg, "-c",
-                                    "android.intent.category.LAUNCHER", "1"],
-                                   capture_output=True, timeout=20)
-                self._log("rokid", "APK 已拉起，等待它连入 18080")
-            except FileNotFoundError:
-                self._log("rokid", f"!! 找不到 adb（{adb}），无法自动拉起 APK")
-            except Exception as e:
-                self._log("rokid", f"!! 拉起 APK 失败: {e}")
-
+                device.launch()
+            except Exception as exc:
+                self._log("rokid", f"[PRE] {exc}")
         threading.Thread(target=run, daemon=True).start()
 
     # ---- 起停单个进程 ----
     def _spawn(self, name):
+        if not self._finish_job(name):
+            raise RuntimeError(f"{name}: previous child processes have not exited")
         self._ready_events[name].clear()  # ← 新增:重试/重启前复位就绪标记
         extra_env = {}
         if name == "rokid":
@@ -524,7 +990,18 @@ class ProcManager:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         # worker / gateway 是上游 MiniCPM-o-Demo 的文件（worker.py / gateway.py），
         # 必须在那个目录下启动才能找到。llama / demo / rokid 用的是绝对路径，不依赖 cwd。
-        if name in ("worker", "gateway"):
+        # harness / demo_funnel 用 `python -m extensions...` 启动，
+        # **cwd 必须是 OpenGlass 仓库根** —— extensions/ 就在它下面。
+        #   ★ 不要用 PYTHONPATH 代替：`-m` 时 sys.path[0] 是 cwd，cwd 优先于
+        #     PYTHONPATH。如果 cwd 设成 MiniCPM-o-Demo 而那边**也有**一份
+        #     extensions/，OpenGlass 这份会被完全遮蔽（改了不生效）；
+        #     更糟的是 PYTHONPATH 把 OpenGlass 根塞进 sys.path，实测导致
+        #     paddle 导入失败（partially initialized module 'paddle' ...
+        #     circular import）→ 方向分类器加载失败 → 回退到错误的早期 CV 判据
+        #     → 第一轮就误报 orient_flipped，然后播报拉长帧间隔又误报 severe_shake。
+        if name in ("harness", "demo_funnel", "rokid"):
+            _cwd = self._repo_root()
+        elif name in ("worker", "gateway"):
             _cwd = self.cfg.get("minicpm_demo_dir") or self.cfg.get("cwd") or None
             if not _cwd:
                 self._log(name, "!! 未配置 minicpm_demo_dir（MiniCPM-o-Demo 目录），"
@@ -537,7 +1014,7 @@ class ProcManager:
             if _cwd and not os.path.isdir(_cwd):
                 self._log(name, f"!! cwd 无效，忽略并用当前目录: {_cwd}")
                 _cwd = None
-        _env = dict(os.environ)
+        _env = self._child_env()
         _env["PYTHONIOENCODING"] = "utf-8"
         _env["PYTHONUTF8"] = "1"
         _env.update(extra_env)   # rokid: ROKID_V7_LOG_FILE / PYTHONUNBUFFERED
@@ -555,14 +1032,39 @@ class ProcManager:
             creationflags=creationflags,
         )
         self.procs[name] = proc
+        if self.cfg["is_windows"]:
+            from runtime.openglass_omni.process_job import WindowsProcessJob
+            try:
+                job = WindowsProcessJob()
+                self._jobs[name] = job
+                job.assign(proc)
+            except Exception:
+                self._force_kill(proc)
+                self._finish_job(name)
+                raise
         threading.Thread(target=self._pump, args=(name, proc), daemon=True).start()
         return proc
 
+    def _finish_job(self, name):
+        job = self._jobs.get(name)
+        if job is None:
+            return True
+        try:
+            job.finish()
+            del self._jobs[name]
+            self._log(name, "进程组已清空（含子进程）")
+            return True
+        except Exception as exc:
+            self._log(name, f"!! 进程组清理失败: {exc}")
+            return False
+
     def _kill(self, name, graceful=False, grace_timeout=20):
+        self._forget_tail_fp(name)   # 进程要没了，指纹一并作废
         proc = self.procs.get(name)
         if not proc or proc.poll() is not None:
-            self.status[name] = "stopped"
-            return
+            clean = self._finish_job(name)
+            self.status[name] = "stopped" if clean else "crashed"
+            return clean
         self._stopping.add(name)   # 标记：这是主动停止，别被轮询判成 crashed
         try:
             if self.cfg["is_windows"]:
@@ -574,6 +1076,7 @@ class ProcManager:
                         proc.send_signal(_sig.CTRL_BREAK_EVENT)
                     except Exception as e:
                         self._log(name, f"CTRL_BREAK 失败({e})，改强杀")
+                        self._backend_recovery_required = True
                         ok = False
                     if ok:
                         try:
@@ -581,14 +1084,15 @@ class ProcManager:
                             self._log(name, "demo 已优雅退出（落盘完成）")
                         except subprocess.TimeoutExpired:
                             self._log(name, f"{grace_timeout}s 未退出，强杀兜底")
+                            self._backend_recovery_required = True
                             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                           capture_output=True)
+                                           capture_output=True, timeout=10)
                     else:
                         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                       capture_output=True)
+                                       capture_output=True, timeout=10)
                 else:
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                   capture_output=True)
+                                   capture_output=True, timeout=10)
             else:
                 proc.terminate()
                 try:
@@ -599,17 +1103,52 @@ class ProcManager:
             self._log(name, f"kill error: {e}")
         finally:
             self._stopping.discard(name)
-        self.status[name] = "stopped"
+        clean = self._finish_job(name)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.status[name] = "crashed"
+            self._log(name, f"!! PID {proc.pid} 尚未退出，禁止启动替代进程")
+            return False
+        self.status[name] = "stopped" if clean else "crashed"
+        return clean
 
     def _force_kill(self, proc):
         try:
             if self.cfg["is_windows"]:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                               capture_output=True)
+                               capture_output=True, timeout=10)
             else:
                 proc.kill()
+            proc.wait(timeout=3)
         except Exception:
             pass
+
+    def _llama_port(self):
+        """从 llama_health_url 解析端口，别硬编码 —— 用户改了配置这里要跟着变。"""
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(self.cfg.get("llama_health_url", ""))
+            return u.port or 22500
+        except Exception:
+            return 22500
+
+    def _all_ports(self):
+        """所有需要确认释放的端口。清理时逐个检查，别只盯 gateway。"""
+        c = self.cfg
+        out = [("gateway", c.get("gateway_port", 8006)),
+               ("worker", c.get("worker_ready_port", 22400)),
+               ("llama", self._llama_port()),
+               ("harness", 8021)]
+        # 第一视角：demo / demo_funnel / rokid 各自可能开着
+        for _p in (8080, 18080):
+            out.append(("demo", _p))
+        seen, uniq = set(), []
+        for label, port in out:
+            if port and port not in seen:
+                seen.add(port)
+                uniq.append((label, int(port)))
+        return uniq
 
     def _kill_by_port(self, port):
         if not self.cfg["is_windows"]:
@@ -634,105 +1173,99 @@ class ProcManager:
         p = self.procs.get(name)
         return p is not None and p.poll() is None
 
+    def _child_env(self):
+        env = dict(os.environ)
+        # Keep external proxy settings, but never proxy local service traffic.
+        bypass = [env.get("NO_PROXY", ""), env.get("no_proxy", ""),
+                  "localhost", "127.0.0.1", "::1"]
+        env["NO_PROXY"] = env["no_proxy"] = ",".join(x for x in bypass if x)
+        return env
+
+    def _http_open(self, url, timeout):
+        import ssl
+        import urllib.request
+        # These are local services; system HTTP proxies must not intercept them.
+        handlers = [urllib.request.ProxyHandler({})]
+        if url.startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        return urllib.request.build_opener(*handlers).open(url, timeout=timeout)
+
     def _http_get_json(self, url, timeout=2.0):
-        import urllib.request, json as _json
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return _json.loads(r.read().decode("utf-8", "replace"))
+            with self._http_open(url, timeout) as response:
+                return json.loads(response.read().decode("utf-8", "replace"))
         except Exception:
             return None
 
     def _http_ok(self, url, timeout=2.0):
-        """GET 返回 HTTP 200 即 True（llama-omni-server /health 用，不解析 body）。"""
-        import urllib.request
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
-                return 200 <= getattr(r, "status", r.getcode()) < 300
+            with self._http_open(url, timeout) as response:
+                return response.status == 200
         except Exception:
             return False
 
+    def _gateway_status(self):
+        url = self.cfg.get("gateway_status_url") or (
+            f"https://127.0.0.1:{self.cfg['gateway_port']}/status")
+        return self._http_get_json(url)
+
+    def _probe_ready(self, name):
+        if name == "llama":
+            return self._http_ok(self.cfg["llama_health_url"]), "backend /health"
+        if name == "worker":
+            port = self.cfg.get("worker_health_port") or self.cfg.get("worker_ready_port", 22400)
+            data = self._http_get_json(f"http://127.0.0.1:{port}/health") or {}
+            return data.get("status") == "healthy", f"worker health={data.get('status', 'unreachable')}"
+        if name == "gateway":
+            data = self._gateway_status() or {}
+            usable = sum(int(data.get(k, 0)) for k in ("idle_workers", "busy_workers", "duplex_workers"))
+            return bool(data.get("gateway_healthy") and usable), f"gateway workers={data}"
+        if name == "harness":
+            data = self._http_get_json(self.cfg.get("harness_health_url", "https://127.0.0.1:8021/health")) or {}
+            ready = data.get("ok") and data.get("enabled") and data.get("asr_loaded")
+            return bool(ready), f"harness health={data}"
+        if name == "rokid":
+            data = self._http_get_json(self.cfg["rokid_health_url"]) or {}
+            ready = data.get("harness_connected") and data.get("gateway_status") == "running"
+            return bool(ready), f"rokid harness={data.get('harness_connected')} gateway={data.get('gateway_status')}"
+        event = self._ready_events.get(name)
+        return bool(event and event.is_set()), "waiting for model session ready"
+
     def _wait_ready_or_die(self, name, timeout):
-        """等就绪，绝不永久卡住；被急停(_cancel)时立即返回 False。"""
-        t_start = time.time()
-        # llama backend 模型加载慢，用更长的专属超时
         if name == "llama":
             timeout = float(self.cfg.get("llama_ready_timeout_s", 300.0))
-        deadline = t_start + timeout
-        wport = self.cfg.get("worker_health_port")
-        health_probe_s = float(self.cfg.get("health_probe_s", 15.0))
-        stable_s = float(self.cfg.get("stable_alive_s", 8.0))
+        deadline = time.monotonic() + timeout
         last_log = 0.0
-        health_ever_reachable = False
-        llama_url = self.cfg.get("llama_health_url", "http://127.0.0.1:22500/health")
-        while time.time() < deadline:
-            if self._cancel.is_set():          # 急停：立刻放弃就绪等待
-                self._log(name, "就绪等待被急停打断")
+        detail = "not probed"
+        while time.monotonic() < deadline:
+            if self._cancel.is_set() or not self._alive(name):
                 return False
-            p = self.procs.get(name)
-            if p is None or p.poll() is not None:
-                return False
-            # 关键字就绪优先：一旦泵线程命中(如 worker 的 22400)立刻放行
-            if self._ready_events.get(name) is not None and self._ready_events[name].is_set():
-                self._log(name, "就绪(关键字命中)，放行")
+            ready, detail = self._probe_ready(name)
+            if ready and not self._cancel.is_set() and self._alive(name):
+                self._log(name, f"Ready: {detail}")
+                if name == "rokid":
+                    self._rokid_post_launch()
                 return True
-            elapsed = time.time() - t_start
-            if name == "llama":
-                # llama-omni-server：轮询 /health 返回 200 才放行（= 你手动的 curl .../health）
-                if self._http_ok(llama_url):
-                    self._log("llama", f"/health 200，backend 就绪，放行")
-                    return True
-                now = time.time()
-                if now - last_log > 5:
-                    self._log("llama", f"等待 backend 加载模型… ({elapsed:.0f}s) {llama_url}")
-                    last_log = now
-            elif name == "worker":
-                if wport:
-                    h = self._http_get_json(f"http://localhost:{wport}/health")
-                    if h is not None:
-                        health_ever_reachable = True
-                        if h.get("status") == "healthy":
-                            self._log("worker", "/health = healthy")
-                            return True
-                    now = time.time()
-                    if now - last_log > 3:
-                        st = h.get("status") if h else "无响应"
-                        self._log("worker", f"等待就绪… /health status={st}")
-                        last_log = now
-                    if (not health_ever_reachable) and elapsed >= health_probe_s and elapsed >= stable_s:
-                        self._log("worker", f"!! {health_probe_s:.0f}s 内 /health 无响应"
-                                            f"(检查 worker_health_port，当前={wport})，"
-                                            f"已按进程稳定存活放行")
-                        return True
-                else:
-                    if elapsed >= stable_s:
-                        return True
-            elif name == "gateway":
-                if self._port_open(self.cfg["gateway_port"]):
-                    return True
-                if elapsed >= max(health_probe_s, stable_s):
-                    self._log("gateway", f"!! {self.cfg['gateway_port']} 未探到，已按稳定存活放行")
-                    return True
-            elif name == "rokid":
-                # bridge 起来了 = 18080 /health 返回 200（真探测，不是 sleep）。
-                # 就绪只代表"PC 侧在等眼镜连"，眼镜连没连要看 /health 里的 clients。
-                if self._http_ok(self.cfg.get("rokid_health_url",
-                                              "http://127.0.0.1:18080/health")):
-                    self._log("rokid", "/health 200，bridge 就绪，等待眼镜 APK 连入")
-                    self._rokid_post_launch()   # USB：此时才拉起 APK（ps1 里也是等 health 再拉）
-                    return True
-                now = time.time()
-                if now - last_log > 3:
-                    self._log("rokid", f"等待 bridge 监听 {self.cfg.get('rokid_port', 18080)}… ({elapsed:.0f}s)")
-                    last_log = now
-            else:  # demo
-                if elapsed >= 3:
-                    return True
-            if not self._sleep(0.4):            # 可被急停打断的间隔
+            if time.monotonic() - last_log >= 5:
+                self._log(name, f"Waiting: {detail}")
+                last_log = time.monotonic()
+            if not self._sleep(0.4):
                 return False
-        p = self.procs.get(name)
-        if p is not None and p.poll() is None and not self._cancel.is_set():
-            self._log(name, "就绪探测超时，但进程存活，放行")
-            return True
+        self._log(name, f"Readiness timeout ({timeout:.0f}s): {detail}; downstream startup blocked")
+        return False
+
+    def _wait_gateway_idle(self, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._cancel.is_set():
+            if not all(self._alive(n) for n in ("llama", "worker", "gateway")):
+                self._log("gateway", "Upstream process exited; client startup blocked")
+                return False
+            data = self._gateway_status() or {}
+            if data.get("gateway_healthy") and int(data.get("idle_workers", 0)) > 0:
+                return True
+            if not self._sleep(0.5):
+                return False
+        self._log("gateway", "No idle worker after session shutdown; client startup blocked")
         return False
 
     def _start_one(self, name):
@@ -744,15 +1277,37 @@ class ProcManager:
             if self._cancel.is_set():
                 return False
             self.status[name] = "starting"
-            self._spawn(name)
+            if name == self.tail() and self._backend_recovery_required:
+                self.status[name] = "crashed"
+                self._log(name, "!! 旧会话关闭未确认；请先全部停止再启动")
+                return False
+            if name == self.tail() and not self._wait_gateway_idle():
+                self.status[name] = "crashed"
+                return False
+            if self._alive(name):
+                self._log(name, "!! 旧进程尚未退出，中止重复启动")
+                return False
+            try:
+                self._spawn(name)
+            except Exception as exc:
+                self.status[name] = "crashed"
+                self._log(name, f"!! 启动/进程托管失败: {exc}")
+                return False
             if self._wait_ready_or_die(name, ready_timeout):
                 self.status[name] = "running"
+                if name == self.tail():
+                    # 记下这次是按哪套配置起的，下次切链路时用来判断要不要重启
+                    self._tail_started_for[name] = self._tail_fingerprint()
                 return True
             # 未就绪/退出/被急停：先把这次 spawn 的进程杀干净，绝不留残余
             p = self.procs.get(name)
             code = p.poll() if p is not None else None
-            if p:
-                self._force_kill(p)
+            if p and not self._kill(name, graceful=(name == self.tail()), grace_timeout=30):
+                return False
+            if name == self.tail():
+                self.status[name] = "crashed"
+                self._log(name, "!! 客户端未就绪，已停止；不自动重复创建模型会话")
+                return False
             if self._cancel.is_set():           # 急停：不再重试
                 self.status[name] = "stopped"
                 return False
@@ -769,27 +1324,104 @@ class ProcManager:
                 return False
         return False
 
+    def _forget_tail_fp(self, name):
+        """进程不在了就清掉指纹，否则下次会误判成"配置没变、跳过启动"。"""
+        self._tail_started_for.pop(name, None)
+
     def _other_tails(self):
         """除当前链路外，其它链路的第四级进程名。"""
         cur = self.tail()
         return [c["tail"] for k, c in self.cfg["chains"].items() if c["tail"] != cur]
 
+    def _tail_fingerprint(self):
+        """当前链路下，尾进程真正依赖的那几个量。
+
+        任何一项变了，已在跑的尾进程就是按旧配置起的，必须重启：
+          chain   决定漏斗档位（--funnel / --no-reject / --force-measure）
+          scene   决定 --scene（严格/日常判据）
+          device  决定 --esp32-host / --esp32-port / --rotate
+          prompt  决定 --prompt
+        """
+        c = self.chain()
+        return (self.current_chain, c.get("funnel", 0), self.current_scene,
+                self.current_device, self.current_prompt)
+
+    def _sweep_stale(self):
+        # A port alone does not prove that its owner belongs to this panel.
+        stale = []
+        for label, port in self._all_ports():
+            if self._alive(label):
+                continue
+            if label == "demo" and (
+                port == 8080 and any(self._alive(n) for n in ("demo", "demo_funnel", "rokid"))
+                or port == 18080 and self._alive("rokid")
+            ):
+                continue
+            if self._port_open(port):
+                stale.append(f"{label}:{port}")
+        if stale:
+            self._log("gateway", "Startup blocked: ports already occupied outside this panel: "
+                      + ", ".join(stale) + "; stop the old instance first (no automatic kill)")
+            return False
+        return True
+
     def _do_start_all(self):
+        if self._shutting_down:
+            return
+        if self._backend_recovery_required:
+            self._log("gateway", "!! 上次会话未安全关闭；请先全部停止，再启动")
+            return
+        # ②③④ 的两个前置检查：extensions 复制了没、档位④的 wav 有没有。
+        # 提前拦住比跑起来才发现好 —— 后者时 duplex 已在跑，没法当场补。
+        if not self._sweep_stale():
+            return
+        if (not self._check_extensions() or not self._check_deps()
+                or not self._check_reject_wav()):
+            return
         """按序补齐：只起没在跑的，已在跑的跳过；被急停立即停下。"""
         # 切链后若另一条链的尾巴还活着，先杀掉——两个客户端同时占一个 gateway
         # 会互相抢 session，必须互斥。
         for other in self._other_tails():
             if self._alive(other):
                 self._log(other, "!! 另一条链路的客户端仍在运行，先停掉（同一 gateway 不能双占）")
-                self._kill(other, graceful=True, grace_timeout=120)
+                if not self._kill(other, graceful=True, grace_timeout=120):
+                    return
 
-        for name in self.chain_procs():
+        order = self.chain_procs()
+        for index, stage in enumerate(order):
+            if stage in ("llama", "worker", "gateway") and not self._alive(stage):
+                # 下游不能沿用已经失效的上游连接。
+                for downstream in reversed(order[index + 1:]):
+                    if self._alive(downstream) and not self._kill(
+                            downstream, graceful=(downstream == self.tail()), grace_timeout=120):
+                        return
+                break
+
+        for name in order:
             if self._cancel.is_set():
                 return
             if self._alive(name):
-                self.status[name] = "running"
-                self._log(name, "已在运行，跳过启动")
-                continue
+                # 尾进程还要比配置指纹：同一个 demo_funnel 进程，
+                # ②③④ 传的参数完全不同，光看"活着"会漏掉重启。
+                if name == self.tail():
+                    want = self._tail_fingerprint()
+                    got = self._tail_started_for.get(name)
+                    if got is not None and got != want:
+                        self._log(name, "配置已变（链路/判据/眼镜/Prompt），重启该进程")
+                        if not self._kill(name, graceful=True, grace_timeout=120):
+                            return
+                    else:
+                        self.status[name] = "running"
+                        self._log(name, "已在运行，跳过启动")
+                        continue
+                else:
+                    self.status[name] = "starting"
+                    if not self._wait_ready_or_die(name, self.cfg.get("ready_timeout_s", 120)):
+                        self.status[name] = "crashed"
+                        self._log(name, "!! 已有进程未通过健康检查，中止后续启动")
+                        return
+                    self.status[name] = "running"
+                    continue
             if not self._start_one(name):
                 if self._cancel.is_set():
                     self._log(name, "!! 启动被急停中止")
@@ -797,17 +1429,41 @@ class ProcManager:
                     self._log(name, "!! 未能就绪，中止后续启动")
                 return
 
-    def start_all(self):
-        """一键启动：串行独占，重复点击直接忽略（杜绝多开）。"""
+    def _configure(self, prompt=None, device=None, chain=None, scene=None):
+        if prompt:
+            self.current_prompt = prompt
+        if device:
+            self.current_device = device
+        if chain in self.cfg["chains"]:
+            self.current_chain = chain
+        if scene in self.cfg.get("scenes", {}):
+            self.current_scene = scene
+
+    def configure(self, **values):
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        try:
+            self._configure(**values)
+            return True
+        finally:
+            self._op_lock.release()
+
+    def start_all(self, **values):
+        # Acquire before dispatch: UI changes cannot alter a launch in progress.
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        if self._shutting_down:
+            self._op_lock.release()
+            return False
+        self._configure(**values)
+        self._cancel.clear()
         def run():
-            if not self._op_lock.acquire(blocking=False):
-                return  # 已有启停操作在进行，忽略这次点击
             try:
-                self._cancel.clear()
                 self._do_start_all()
             finally:
                 self._op_lock.release()
         threading.Thread(target=run, daemon=True).start()
+        return True
 
     def _stop_all_sync(self):
         # 先停另一条链可能残留的尾巴，再按当前链路逆序停。
@@ -815,11 +1471,18 @@ class ProcManager:
         tails = {c["tail"] for c in self.cfg["chains"].values()}
         for other in self._other_tails():
             if self._alive(other):
-                self._kill(other, graceful=True)
+                self._kill(other, graceful=True, grace_timeout=120)
                 time.sleep(0.3)
         for name in self.chain()["stop_order"]:
-            self._kill(name, graceful=(name in tails))
+            self._kill(name, graceful=(name in tails), grace_timeout=120)
             time.sleep(0.3)
+        # 当前链路的 stop_order 只覆盖这条链；切过链路的话别的进程会漏掉。
+        # 兜底：把 procs 里所有还活着的都停掉。
+        for name in self.cfg["procs"]:
+            if self._alive(name):
+                self._log(name, "不在当前链路但仍在运行，一并停止")
+                self._kill(name, graceful=(name in tails), grace_timeout=120)
+                time.sleep(0.2)
         for name in self.cfg["procs"]:
             proc = self.procs.get(name)
             if proc is not None and proc.poll() is not None:
@@ -827,13 +1490,22 @@ class ProcManager:
             if proc is not None:
                 self._log(name, "!! 仍在运行，强杀兜底")
                 self._force_kill(proc)
-        if self._wait_port(self.cfg["gateway_port"], up=False, timeout=8):
-            self._log("gateway", f"端口 {self.cfg['gateway_port']} 已释放，全部已停止")
-        else:
-            self._log("gateway", f"!! {self.cfg['gateway_port']} 仍被占用，尝试按端口强杀")
-            self._kill_by_port(self.cfg["gateway_port"])
+        # Never kill an unrelated process merely because it has reused a port.
+        for name in list(self._jobs):
+            self._finish_job(name)
+        left = [f"{label}:{port}" for label, port in self._all_ports() if self._port_open(port)]
+        if left:
+            self._log("gateway", "Ports still occupied: " + ", ".join(left))
         for name in self.cfg["procs"]:
-            self.status[name] = "stopped"
+            self.status[name] = "crashed" if self._alive(name) or name in self._jobs else "stopped"
+            self._forget_tail_fp(name)
+        if not any(self._alive(name) for name in self.cfg["procs"]) and not left and not self._jobs:
+            self._backend_recovery_required = False
+            self._log("gateway", "全部停止完成：托管进程及子进程已退出，服务端口已释放")
+            return True
+        self._backend_recovery_required = True
+        self._log("gateway", "!! 清理未完成，禁止重新启动；请查看残留进程/端口日志")
+        return False
 
     def stop_all(self):
         """全部停止：等同三个 Ctrl+C。先发急停打断任何正在进行的启动，再彻底杀干净。"""
@@ -850,35 +1522,28 @@ class ProcManager:
             self._cancel.set()
             with self._op_lock:
                 self._cancel.clear()
-                self._stop_all_sync()
+                if not self._stop_all_sync():
+                    return
                 if not self._sleep(1.5):
                     return
                 self._do_start_all()
         threading.Thread(target=run, daemon=True).start()
 
     def restart_demo(self, prompt, device=None):
-        """切 prompt = 用新 prompt 重启当前链路的第四级（demo 或 rokid bridge）。
-        worker/gateway 不动。忙则忽略防多开。"""
+        if not self._op_lock.acquire(blocking=False):
+            return False
+        self._configure(prompt=prompt, device=device)
+        self._cancel.clear()
         def run():
-            if not self._op_lock.acquire(blocking=False):
-                return
             try:
-                if prompt:
-                    self.current_prompt = prompt
-                if device:
-                    self.current_device = device
-                t = self.tail()                      # ← demo 或 rokid
-                self._kill(t, graceful=True, grace_timeout=120)
-                if not self._sleep(1.0):
+                if not self._kill(self.tail(), graceful=True, grace_timeout=120):
                     return
-                self.status[t] = "starting"
-                self._spawn(t)
-                if not self._sleep(1.0):
-                    return
-                self.status[t] = "running" if self.procs[t].poll() is None else "crashed"
+                # Reuse the same readiness/dependency path as a full start.
+                self._do_start_all()
             finally:
                 self._op_lock.release()
         threading.Thread(target=run, daemon=True).start()
+        return True
 
     def stop_demo(self):
         """停止：只停当前链路的第四级（优雅落盘），保住 worker/gateway。忙则忽略。"""
@@ -892,13 +1557,12 @@ class ProcManager:
         threading.Thread(target=run, daemon=True).start()
 
     def set_chain(self, chain):
-        """切链路。若已有进程在跑，停掉另一条链的尾巴由下次 start_all 处理。"""
-        if chain in self.cfg["chains"]:
-            self.current_chain = chain
+        self.configure(chain=chain)
         return self.current_chain
 
     def shutdown(self):
         """关窗时同步清理，阻塞直到全停（比原来的异步 stop_all 更可靠）。"""
+        self._shutting_down = True
         self._cancel.set()
         with self._op_lock:
             self._stop_all_sync()
@@ -935,38 +1599,39 @@ class Api:
         # 每条链路把自己的 fpv 地址/是否要选眼镜一并给前端，前端切链即切界面
         chains = {}
         for k, c in self.cfg["chains"].items():
+            if c.get("hidden", False):
+                continue
             chains[k] = {
                 "label": c["label"],
                 "need_device": c["need_device"],
                 "fpv_url": self.cfg.get(c["fpv_key"], ""),
                 "procs": c["start_order"],
+                # 只有开了漏斗的链路(③④)才需要选判据档位；①②选了也不起作用
+                "need_scene": int(c.get("funnel", 0)) > 0,
             }
         return {
             "presets": self.cfg["presets"],
             "fpv_url": self.cfg["fpv_url"],
             "devices": self.cfg.get("devices", []),
             "chains": chains,
+            "scenes": list(self.cfg.get("scenes", {}).keys()),
+            "default_scene": self.cfg.get("default_scene", ""),
+            "proc_labels": self.cfg.get("proc_labels", {}),
             "default_chain": self.cfg.get("default_chain", "esp32"),
         }
 
     def set_chain(self, chain):
         return self.mgr.set_chain(chain)
 
-    def set_device(self, device):
-        if device:
-            self.mgr.current_device = device
-        return "ok"
+    def set_scene(self, scene):
+        return "ok" if self.mgr.configure(scene=scene) else "busy"
 
-    def start_all(self, prompt=None, device=None, chain=None):
-        # prompt 来自前端文本框（用户选的 preset 或编辑后的内容）。在起进程前更新
-        # current_prompt，否则一键启动只会用初始的第一个 preset。
-        if prompt:
-            self.mgr.current_prompt = prompt
-        if chain:
-            self.mgr.set_chain(chain)
-        if device:
-            self.mgr.current_device = device
-        self.mgr.start_all(); return "ok"
+    def set_device(self, device):
+        return "ok" if self.mgr.configure(device=device) else "busy"
+
+    def start_all(self, prompt=None, device=None, chain=None, scene=None):
+        return "ok" if self.mgr.start_all(
+            prompt=prompt, device=device, chain=chain, scene=scene) else "busy"
 
     def stop_all(self):
         self.mgr.stop_all(); return "ok"
@@ -1004,11 +1669,32 @@ def main():
         height=780,
         min_size=(900, 640),
     )
-    webview.start()
-    # 关窗时兜底：确保所有子进程被清掉
-    mgr.shutdown()
-    #mgr.stop_all()
-    #time.sleep(1)
+    # 兜底 ①：进程正常退出时（含异常传播）一定会跑
+    import atexit
+    atexit.register(mgr.shutdown)
+
+    # 兜底 ②：Ctrl+C / 控制台关闭
+    def _sig_cleanup(signum, frame):
+        try:
+            mgr.shutdown()
+        finally:
+            os._exit(0)
+    for _s in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        _sv = getattr(signal, _s, None)
+        if _sv is not None:
+            try:
+                signal.signal(_sv, _sig_cleanup)
+            except Exception:
+                pass
+
+    try:
+        webview.start()
+    finally:
+        # 兜底 ③：webview 抛异常时也要清
+        #   以前只在 start() 之后直接调 shutdown()，异常路径下压根不执行 ——
+        #   于是 llama/worker/gateway/harness 全留着，端口占着、
+        #   gateway 里旧 session 挂着，下次启动永远卡在 queue position=1。
+        mgr.shutdown()
 
 
 if __name__ == "__main__":

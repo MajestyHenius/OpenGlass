@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.OpenGlassRokidSensor" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#33ff77</item>
+    </style>
+</resources>
